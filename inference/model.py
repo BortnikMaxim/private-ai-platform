@@ -1,3 +1,4 @@
+import threading
 import time
 
 from mlx_vlm import generate, load, stream_generate
@@ -14,6 +15,7 @@ class GemmaService:
 
         self.model, self.processor = load(MODEL_ID)
         self.config = load_config(MODEL_ID)
+        self.inference_lock = threading.Lock()
 
         print("Model loaded successfully")
 
@@ -23,7 +25,6 @@ class GemmaService:
         max_tokens: int = 300,
         temperature: float = 0.2,
     ) -> tuple[str, float]:
-
         formatted_prompt = apply_chat_template(
             self.processor,
             self.config,
@@ -33,14 +34,15 @@ class GemmaService:
 
         start = time.perf_counter()
 
-        result = generate(
-            self.model,
-            self.processor,
-            formatted_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            verbose=False,
-        )
+        with self.inference_lock:
+            result = generate(
+                self.model,
+                self.processor,
+                formatted_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                verbose=False,
+            )
 
         elapsed = time.perf_counter() - start
 
@@ -52,7 +54,6 @@ class GemmaService:
         max_tokens: int = 300,
         temperature: float = 0.2,
     ) -> tuple[str, float]:
-
         formatted_prompt = self.processor.apply_chat_template(
             messages,
             tokenize=False,
@@ -61,14 +62,15 @@ class GemmaService:
 
         start = time.perf_counter()
 
-        result = generate(
-            self.model,
-            self.processor,
-            formatted_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            verbose=False,
-        )
+        with self.inference_lock:
+            result = generate(
+                self.model,
+                self.processor,
+                formatted_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                verbose=False,
+            )
 
         elapsed = time.perf_counter() - start
 
@@ -86,13 +88,15 @@ class GemmaService:
             add_generation_prompt=True,
         )
 
-        for result in stream_generate(
-            self.model,
-            self.processor,
-            formatted_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        ):
-            yield result.text
+        with self.inference_lock:
+            for result in stream_generate(
+                self.model,
+                self.processor,
+                formatted_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ):
+                yield result.text
+
 
 gemma_service = GemmaService()
