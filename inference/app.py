@@ -1,9 +1,11 @@
 import logging
+import os
 import time
 import uuid
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import PlainTextResponse, StreamingResponse
+from prometheus_client import Counter, Histogram, generate_latest
 
 from inference.logging_config import setup_logging
 from inference.model import MODEL_ID, gemma_service
@@ -17,40 +19,54 @@ from inference.schemas import (
 
 
 setup_logging()
-
 logger = logging.getLogger("inference_api")
+
+API_KEY = os.getenv("INFERENCE_API_KEY", "dev-secret")
+
+
+REQUEST_COUNT = Counter(
+    "inference_requests_total",
+    "Total inference API requests",
+    ["endpoint", "status"],
+)
+
+REQUEST_LATENCY = Histogram(
+    "inference_request_duration_seconds",
+    "Inference request duration",
+    ["endpoint"],
+)
+
+GENERATION_LATENCY = Histogram(
+    "llm_generation_duration_seconds",
+    "LLM generation duration",
+)
 
 
 app = FastAPI(
     title="Private AI Inference Service",
-    version="0.3.0",
+    version="0.4.0",
 )
+
+
+def verify_api_key(x_api_key: str | None) -> None:
+    if x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+        )
 
 
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-
     request.state.request_id = request_id
 
     start = time.perf_counter()
 
-    logger.info(
-        "request_started",
-        extra={
-            "request_id": request_id,
-            "method": request.method,
-            "path": request.url.path,
-        },
-    )
-
     try:
         response = await call_next(request)
 
-        duration_ms = round(
-            (time.perf_counter() - start) * 1000,
-            2,
-        )
+        duration = time.perf_counter() - start
 
         response.headers["X-Request-ID"] = request_id
 
@@ -61,29 +77,21 @@ async def request_context_middleware(request: Request, call_next):
                 "method": request.method,
                 "path": request.url.path,
                 "status_code": response.status_code,
-                "duration_ms": duration_ms,
+                "duration_ms": round(duration * 1000, 2),
             },
         )
 
         return response
 
     except Exception:
-        duration_ms = round(
-            (time.perf_counter() - start) * 1000,
-            2,
-        )
-
         logger.exception(
             "request_failed",
             extra={
                 "request_id": request_id,
                 "method": request.method,
                 "path": request.url.path,
-                "status_code": 500,
-                "duration_ms": duration_ms,
             },
         )
-
         raise
 
 
@@ -95,9 +103,27 @@ def health():
     }
 
 
+@app.get("/ready")
+def ready():
+    return {
+        "status": "ready",
+        "model": MODEL_ID,
+    }
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics():
+    return generate_latest().decode("utf-8")
+
+
 @app.post("/v1/generate", response_model=GenerateResponse)
-def generate_text(request: GenerateRequest, http_request: Request):
-    request_id = http_request.state.request_id
+def generate_text(
+    request: GenerateRequest,
+    x_api_key: str | None = Header(default=None),
+):
+    verify_api_key(x_api_key)
+
+    start = time.perf_counter()
 
     try:
         text, elapsed = gemma_service.generate(
@@ -106,13 +132,14 @@ def generate_text(request: GenerateRequest, http_request: Request):
             temperature=request.temperature,
         )
 
-        logger.info(
-            "generation_completed",
-            extra={
-                "request_id": request_id,
-                "generation_time_seconds": round(elapsed, 3),
-            },
+        GENERATION_LATENCY.observe(elapsed)
+        REQUEST_LATENCY.labels(endpoint="/v1/generate").observe(
+            time.perf_counter() - start
         )
+        REQUEST_COUNT.labels(
+            endpoint="/v1/generate",
+            status="success",
+        ).inc()
 
         return GenerateResponse(
             model=MODEL_ID,
@@ -121,12 +148,10 @@ def generate_text(request: GenerateRequest, http_request: Request):
         )
 
     except Exception as exc:
-        logger.exception(
-            "generation_failed",
-            extra={
-                "request_id": request_id,
-            },
-        )
+        REQUEST_COUNT.labels(
+            endpoint="/v1/generate",
+            status="error",
+        ).inc()
 
         raise HTTPException(
             status_code=500,
@@ -135,31 +160,37 @@ def generate_text(request: GenerateRequest, http_request: Request):
 
 
 @app.post("/v1/chat", response_model=ChatResponse)
-def chat(request: ChatRequest, http_request: Request):
-    request_id = http_request.state.request_id
+def chat(
+    request: ChatRequest,
+    x_api_key: str | None = Header(default=None),
+):
+    verify_api_key(x_api_key)
+
+    messages = [
+        {
+            "role": message.role,
+            "content": message.content,
+        }
+        for message in request.messages
+    ]
+
+    start = time.perf_counter()
 
     try:
-        messages = [
-            {
-                "role": message.role,
-                "content": message.content,
-            }
-            for message in request.messages
-        ]
-
         text, elapsed = gemma_service.chat(
             messages=messages,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
         )
 
-        logger.info(
-            "chat_completed",
-            extra={
-                "request_id": request_id,
-                "generation_time_seconds": round(elapsed, 3),
-            },
+        GENERATION_LATENCY.observe(elapsed)
+        REQUEST_LATENCY.labels(endpoint="/v1/chat").observe(
+            time.perf_counter() - start
         )
+        REQUEST_COUNT.labels(
+            endpoint="/v1/chat",
+            status="success",
+        ).inc()
 
         return ChatResponse(
             model=MODEL_ID,
@@ -171,12 +202,10 @@ def chat(request: ChatRequest, http_request: Request):
         )
 
     except Exception as exc:
-        logger.exception(
-            "chat_failed",
-            extra={
-                "request_id": request_id,
-            },
-        )
+        REQUEST_COUNT.labels(
+            endpoint="/v1/chat",
+            status="error",
+        ).inc()
 
         raise HTTPException(
             status_code=500,
@@ -185,8 +214,11 @@ def chat(request: ChatRequest, http_request: Request):
 
 
 @app.post("/v1/chat/stream")
-def chat_stream(request: ChatRequest, http_request: Request):
-    request_id = http_request.state.request_id
+def chat_stream(
+    request: ChatRequest,
+    x_api_key: str | None = Header(default=None),
+):
+    verify_api_key(x_api_key)
 
     messages = [
         {
@@ -208,29 +240,21 @@ def chat_stream(request: ChatRequest, http_request: Request):
                 yield chunk
 
             elapsed = time.perf_counter() - start
+            GENERATION_LATENCY.observe(elapsed)
 
-            logger.info(
-                "stream_completed",
-                extra={
-                    "request_id": request_id,
-                    "generation_time_seconds": round(elapsed, 3),
-                },
-            )
+            REQUEST_COUNT.labels(
+                endpoint="/v1/chat/stream",
+                status="success",
+            ).inc()
 
         except Exception:
-            logger.exception(
-                "stream_failed",
-                extra={
-                    "request_id": request_id,
-                },
-            )
-
+            REQUEST_COUNT.labels(
+                endpoint="/v1/chat/stream",
+                status="error",
+            ).inc()
             raise
 
     return StreamingResponse(
         token_stream(),
         media_type="text/plain",
-        headers={
-            "X-Request-ID": request_id,
-        },
     )
