@@ -1,0 +1,47 @@
+[project]
+name = "private-ai-platform"
+version = "0.3.0"
+description = "Self-hosted RAG platform with a local MLX/Gemma inference service"
+requires-python = ">=3.11"
+
+# This is a deployed application, not a distributable package: there is no
+# [build-system] and `pip install -e .` is not supported. Runtime dependencies
+# live in requirements.txt, development ones in requirements-dev.txt.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "venv", "migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "BLE",
+    "C4",
+    "SIM",
+    "RUF",
+]
+ignore = [
+    "B008",
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-m 'not integration'"
+markers = [
+    "integration: requires live PostgreSQL, Qdrant or the inference service",
+]

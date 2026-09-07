@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: private-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-privateai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-privateai_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-privateai}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-privateai} -d ${POSTGRES_DB:-privateai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: private-ai-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    # Pinned to the version this project was developed against; `latest` made
+    # the stack non-reproducible.
+    image: qdrant/qdrant:v1.19.1
+    container_name: private-ai-qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # No healthcheck: the Qdrant image ships without curl, wget or nc, so there
+    # is no in-container way to probe the HTTP API. The backend reports Qdrant
+    # status through GET /health instead.
+
+# The MLX/Gemma inference service is intentionally NOT containerised: it needs
+# native Apple Silicon Metal access and runs on the host at 127.0.0.1:8001.
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:

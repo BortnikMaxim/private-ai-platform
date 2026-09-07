@@ -1,277 +1,182 @@
 import logging
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 
-import httpx
 import redis.asyncio as redis
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from qdrant_client import AsyncQdrantClient
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from backend.config import settings
-from backend.rag import RAGService
+from backend.api import conversations, documents, health, rag
+from backend.config import Settings
+from backend.config import settings as default_settings
+from backend.db import create_engine
+from backend.errors import AppError
+from backend.services.conversation_service import ConversationService
+from backend.services.document_service import DocumentService
+from backend.services.embeddings import EmbeddingService
+from backend.services.inference_client import InferenceClient
+from backend.services.rag_service import RagService
+from backend.services.vector_store import VectorStore
 
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend")
 
 
-app = FastAPI(
-    title="Private AI Platform API",
-    version="0.2.0",
-)
-
-
-engine = create_async_engine(
-    settings.database_url,
-    pool_pre_ping=True,
-)
-
-redis_client = redis.from_url(
-    settings.redis_url,
-    decode_responses=True,
-)
-
-qdrant_client = AsyncQdrantClient(
-    url=settings.qdrant_url,
-)
-
-rag_service = RAGService(
-    qdrant_url=settings.qdrant_url
-)
-
-
-class AskRequest(BaseModel):
-    question: str = Field(
-        min_length=1,
-        max_length=5000,
-    )
-
-    top_k: int = Field(
-        default=5,
-        ge=1,
-        le=20,
+def configure_logging(settings: Settings) -> None:
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
 
-class Source(BaseModel):
-    filename: str | None
-    page: int | None
-    score: float
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Create the long lived resources once and tear them down on shutdown."""
+    settings: Settings = app.state.settings
 
+    configure_logging(settings)
 
-class AskResponse(BaseModel):
-    answer: str
-    sources: list[Source]
-
-
-@app.get("/health")
-async def health():
-    results = {
-        "api": "ok",
-        "postgres": "unknown",
-        "redis": "unknown",
-        "qdrant": "unknown",
-        "inference": "unknown",
-    }
-
-    try:
-        async with engine.connect() as connection:
-            result = await connection.execute(
-                text("SELECT 1")
-            )
-            result.scalar_one()
-
-        results["postgres"] = "ok"
-
-    except Exception as exc:
-        logger.exception(
-            "PostgreSQL health check failed: %s",
-            exc,
-        )
-        results["postgres"] = "error"
-
-    try:
-        await redis_client.ping()
-        results["redis"] = "ok"
-
-    except Exception:
-        results["redis"] = "error"
-
-    try:
-        await qdrant_client.get_collections()
-        results["qdrant"] = "ok"
-
-    except Exception:
-        results["qdrant"] = "error"
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=3.0
-        ) as client:
-            response = await client.get(
-                f"{settings.inference_url}/health"
-            )
-            response.raise_for_status()
-
-        results["inference"] = "ok"
-
-    except Exception:
-        results["inference"] = "error"
-
-    return results
-
-
-@app.post("/documents/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-):
-    if not file.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Filename is required",
+    if not settings.inference_api_key:
+        logger.warning(
+            "INFERENCE_API_KEY is not set; calls to the inference service "
+            "will be rejected with 401"
         )
 
-    if not file.filename.lower().endswith(
-        ".pdf"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are supported",
+    # Every resource is registered with the exit stack as soon as it exists, so
+    # a failure while building a later one still tears down the earlier ones.
+    async with AsyncExitStack() as stack:
+        db_engine = create_engine(settings.database_url)
+        stack.push_async_callback(db_engine.dispose)
+
+        qdrant_client = AsyncQdrantClient(url=settings.qdrant_url)
+        vector_store = VectorStore(
+            client=qdrant_client,
+            collection_name=settings.qdrant_collection,
+            vector_size=settings.embedding_dim,
+        )
+        stack.push_async_callback(vector_store.aclose)
+
+        redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+        stack.push_async_callback(redis_client.aclose)
+
+        inference_client = InferenceClient(
+            base_url=settings.inference_url,
+            api_key=settings.inference_api_key,
+            timeout=settings.inference_timeout_seconds,
+            health_timeout=settings.inference_health_timeout_seconds,
+            default_max_tokens=settings.inference_max_tokens,
+            default_temperature=settings.inference_temperature,
+        )
+        stack.push_async_callback(inference_client.aclose)
+
+        embeddings = EmbeddingService(
+            embedding_model=settings.embedding_model,
+            reranker_model=settings.reranker_model,
         )
 
-    file_bytes = await file.read()
-
-    try:
-        result = await rag_service.ingest_pdf(
-            filename=file.filename,
-            file_bytes=file_bytes,
+        rag_service = RagService(
+            embeddings=embeddings,
+            vector_store=vector_store,
+            settings=settings,
         )
 
-        return result
-
-    except Exception as exc:
-        logger.exception(
-            "Document ingestion failed"
+        document_service = DocumentService(
+            embeddings=embeddings,
+            vector_store=vector_store,
+            settings=settings,
         )
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        ) from exc
+        conversation_service = ConversationService(
+            inference=inference_client,
+            rag=rag_service,
+            documents=document_service,
+            settings=settings,
+        )
+
+        app.state.engine = db_engine
+        app.state.session_factory = async_sessionmaker(
+            bind=db_engine,
+            expire_on_commit=False,
+            autoflush=False,
+        )
+        app.state.redis = redis_client
+        app.state.qdrant_client = qdrant_client
+        app.state.vector_store = vector_store
+        app.state.inference_client = inference_client
+        app.state.embeddings = embeddings
+        app.state.rag_service = rag_service
+        app.state.document_service = document_service
+        app.state.conversation_service = conversation_service
+
+        # A missing collection or an unreachable Qdrant must not stop the API
+        # from serving /health, which is how an operator finds out what broke.
+        try:
+            await vector_store.ensure_collection()
+        except Exception:
+            logger.exception("qdrant_collection_setup_failed")
+
+        if settings.preload_models:
+            try:
+                await embeddings.ensure_loaded()
+            except Exception:
+                logger.exception("model_preload_failed")
+
+        logger.info("backend_started version=%s", settings.app_version)
+
+        try:
+            yield
+        finally:
+            logger.info("backend_stopping")
+
+    logger.info("backend_stopped")
 
 
-@app.post(
-    "/rag/ask",
-    response_model=AskResponse,
-)
-async def ask_rag(
-    request: AskRequest,
-):
-    retrieved = await rag_service.retrieve(
-        question=request.question,
-        top_k=request.top_k,
+async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Defensive: an `assert` here would be stripped under `python -O`.
+    if not isinstance(exc, AppError):
+        return await unhandled_error_handler(request, exc)
+
+    if exc.status_code >= 500:
+        logger.exception("app_error path=%s", request.url.path)
+    else:
+        logger.info(
+            "app_error path=%s status=%d detail=%s",
+            request.url.path,
+            exc.status_code,
+            exc.detail,
+        )
+
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    # The traceback belongs in the log, never in the response body.
+    logger.exception("unhandled_error path=%s", request.url.path)
+
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or default_settings
+
+    app = FastAPI(
+        title=settings.app_name,
+        version=settings.app_version,
+        lifespan=lifespan,
     )
 
-    if not retrieved:
-        raise HTTPException(
-            status_code=404,
-            detail="No relevant documents found",
-        )
+    app.state.settings = settings
 
-    context_parts = []
+    app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(Exception, unhandled_error_handler)
 
-    for index, item in enumerate(
-        retrieved,
-        start=1,
-    ):
-        context_parts.append(
-            (
-                f"[SOURCE {index}]\n"
-                f"File: {item['filename']}\n"
-                f"Page: {item['page']}\n"
-                f"Text:\n{item['text']}"
-            )
-        )
+    app.include_router(health.router)
+    app.include_router(documents.router)
+    app.include_router(conversations.router)
+    app.include_router(rag.router)
 
-    context = "\n\n".join(
-        context_parts
-    )
+    return app
 
-    system_prompt = (
-        "Ты корпоративный AI-ассистент. "
-        "Отвечай только на основе переданного контекста. "
-        "Если ответа в контексте нет, прямо скажи, "
-        "что информации недостаточно. "
-        "Не придумывай факты. "
-        "При ответе указывай источники в формате "
-        "[SOURCE N]."
-    )
 
-    user_prompt = (
-        f"КОНТЕКСТ:\n\n{context}\n\n"
-        f"ВОПРОС:\n{request.question}"
-    )
-
-    payload = {
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_prompt,
-            },
-        ],
-        "max_tokens": 500,
-        "temperature": 0.1,
-    }
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=120.0
-        ) as client:
-            response = await client.post(
-                (
-                    f"{settings.inference_url}"
-                    "/v1/chat"
-                ),
-                headers={
-                    "X-API-Key": (
-                        settings.inference_api_key
-                    )
-                },
-                json=payload,
-            )
-
-            response.raise_for_status()
-
-            result = response.json()
-
-    except Exception as exc:
-        logger.exception(
-            "Inference request failed"
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail="Inference service failed",
-        ) from exc
-
-    sources = [
-        Source(
-            filename=item["filename"],
-            page=item["page"],
-            score=round(
-                float(item["score"]),
-                4,
-            ),
-        )
-        for item in retrieved
-    ]
-
-    return AskResponse(
-        answer=result["message"]["content"],
-        sources=sources,
-    )
+app = create_app()
