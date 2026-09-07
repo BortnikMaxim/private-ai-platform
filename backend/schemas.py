@@ -160,6 +160,38 @@ class MessageResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+
+class AgentMessageCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=5000)
+    # The agent may still route away from retrieval; this is a hint, and it
+    # decides the safe default when routing cannot be trusted.
+    use_rag: bool = True
+    document_ids: list[uuid.UUID] | None = Field(default=None, max_length=50)
+
+
+class ToolUsed(BaseModel):
+    name: str
+    success: bool
+    error: str | None = None
+
+
+class AgentMessageResponse(BaseModel):
+    """Agent turn result.
+
+    Deliberately carries no prompts, no routing rationale and no intermediate
+    reasoning — only the answer and auditable metadata.
+    """
+
+    message: MessageRead
+    route: str
+    tools_used: list[ToolUsed] = Field(default_factory=list)
+    sources: list[Source] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # RAG
 # ---------------------------------------------------------------------------
 

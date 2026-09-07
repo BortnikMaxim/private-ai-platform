@@ -60,6 +60,18 @@ class Settings(BaseSettings):
     # --- chat -----------------------------------------------------------
     chat_history_limit: int = Field(default=20, ge=1, le=200)
 
+    # --- agent -----------------------------------------------------------
+    # Hard ceiling on graph nodes executed per request. The graph is a fixed
+    # DAG (classify -> branch -> compose), so a normal run uses 3; the limit
+    # exists so that future extensions can never turn into a runaway loop.
+    agent_max_steps: int = Field(default=6, ge=1, le=50)
+    # Structured calls (routing, tool selection) want deterministic output.
+    agent_router_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    agent_structured_max_tokens: int = Field(default=300, ge=32, le=2000)
+    agent_answer_max_tokens: int = Field(default=600, ge=32, le=2000)
+    # A structured call is attempted once, then repaired at most once.
+    agent_structured_repair_attempts: int = Field(default=1, ge=0, le=2)
+
     # --- uploads ---------------------------------------------------------
     max_upload_size_mb: int = Field(default=25, ge=1, le=500)
     # Where uploaded PDFs live until a worker has ingested them. Relative paths

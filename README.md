@@ -5,7 +5,7 @@ embeddings, conversation history and the LLM never leave the host: generation is
 served by a local Gemma model through MLX on Apple Silicon.
 
 - **Backend** — FastAPI service (`http://127.0.0.1:8000`) with documents,
-  conversations and RAG APIs.
+  conversations, RAG and a LangGraph [agent layer](#agent-architecture).
 - **Celery worker** — ingests uploaded PDFs in the background. Runs **natively**
   next to the backend, because it loads the embedding models.
 - **Inference service** — separate FastAPI service (`http://127.0.0.1:8001`)
@@ -117,9 +117,21 @@ backend/
   schemas.py             request/response models
   dependencies.py        DI providers backed by app.state
   errors.py              domain errors mapped to HTTP status codes
-  prompts.py             system prompts
-  observability.py       Prometheus metrics + stage logging
+  prompts/               system prompts (__init__.py, agent.py)
+  observability.py       Prometheus metrics + stage/agent logging
   api/                   health.py, documents.py, conversations.py, rag.py
+  agent/
+    graph.py               LangGraph state machine + AgentService
+    state.py               typed, JSON-serialisable AgentState
+    nodes.py               classify / direct / rag / tool / fallback / compose
+    schemas.py             Pydantic models the LLM must fill in
+    structured.py          strict JSON output with one repair attempt
+    tools/
+      base.py                Tool interface and ToolContext
+      registry.py            explicit allowlist, argument validation
+      calculator.py          AST-allowlist arithmetic (no eval)
+      documents.py           search_documents, get_document_metadata
+      datetime_tool.py       get_current_datetime
   services/
     chunking.py            PDF extraction + word-window chunking (pure)
     embeddings.py          e5 encoder + cross-encoder reranker (loaded once)
@@ -467,6 +479,159 @@ curl -s -X POST http://127.0.0.1:8000/rag/retrieve \
 
 ---
 
+## Agent Architecture
+
+`POST /conversations/{id}/agent` answers a turn through a LangGraph state
+machine that decides *how* to answer before answering. It sits on top of the
+services that already exist — it does not replace them, and every endpoint above
+keeps working exactly as before.
+
+**It is not an autonomous loop.** The graph is a fixed, acyclic state machine
+with four branches that all converge on a single composition step. There is no
+edge back to the router, so a run visits exactly three nodes. `AGENT_MAX_STEPS`
+(default 6) is a hard ceiling every node checks anyway, so extending the graph
+later can never turn it into a runaway.
+
+```mermaid
+flowchart TD
+    User([User turn]) --> Classify{classify<br/>structured LLM output}
+
+    Classify -->|direct_answer| Direct[LLM only<br/>history, no context]
+    Classify -->|rag_search| Rag[RagService:<br/>retrieve → rerank]
+    Classify -->|tool| Tools[Tool registry<br/>allowlist]
+    Classify -->|unparseable| Fallback[safe fallback]
+
+    Tools --> Calc[calculator]
+    Tools --> Search[search_documents]
+    Tools --> Meta[get_document_metadata]
+    Tools --> Clock[get_current_datetime]
+
+    Direct --> Compose[compose_answer]
+    Rag --> Compose
+    Calc --> Compose
+    Search --> Compose
+    Meta --> Compose
+    Clock --> Compose
+    Fallback --> Compose
+
+    Compose --> Answer([Answer + route + tools + sources])
+```
+
+### Routes
+
+| Route | When | What runs |
+| --- | --- | --- |
+| `direct_answer` | ordinary question or chit-chat | the model, with history and no retrieved context |
+| `rag_search` | question about the document base | the existing `RagService` — retrieve, rerank, ground |
+| `tool` | arithmetic, clock, document metadata, explicit search | one whitelisted tool, then the model summarises its result |
+| `fallback` | routing could not be trusted | a short, honest "please rephrase" answer |
+
+### Tools
+
+There is no `eval`, no dynamic import and no lookup by string. The registry is
+an explicit allowlist of instances, and arguments are validated against each
+tool's Pydantic schema *before* anything executes.
+
+| Tool | Arguments | Notes |
+| --- | --- | --- |
+| `calculator` | `expression` | `+ - * / ** %` and parentheses, AST allowlist |
+| `search_documents` | `query`, `document_ids?`, `top_k?` | delegates to `RagService`; produces citable sources |
+| `get_document_metadata` | `document_id` | reads PostgreSQL |
+| `get_current_datetime` | — | UTC, no external API |
+
+The calculator parses with `ast` and walks the tree by hand. Only
+`Expression`, `BinOp`, `UnaryOp`, `Constant` and the six arithmetic operators
+are accepted; names, calls, attributes, subscripts, comprehensions and literals
+of any other type are rejected before evaluation. Expression length, AST depth,
+result magnitude and exponent size are all bounded, and a power is rejected on
+its estimated magnitude *before* it is computed — `10 ** 100000000` fails
+instantly rather than allocating.
+
+### Structured tool calling
+
+The local Gemma build has neither a JSON mode nor native function calling, so
+the contract is enforced from our side: a strict system prompt plus the model's
+JSON Schema, then the first balanced `{...}` is located in the reply and
+validated with Pydantic. An invalid reply gets **one** repair round trip that
+shows the model its own output and the validation error. A second failure gives
+up — two LLM calls is the hard ceiling, there is no repair loop.
+
+```json
+{"route": "tool", "tool_name": "calculator", "reason": "…"}
+{"tool": "calculator", "arguments": {"expression": "125 * 8"}}
+```
+
+### Fallback behaviour
+
+| Situation | Result |
+| --- | --- |
+| routing output unparseable after one repair | `rag_search` if `use_rag`, else `direct_answer` |
+| router names a tool that is not in the registry | degrade to the safe default route |
+| tool selection unparseable after one repair | `fallback` route, honest answer |
+| unknown tool / invalid arguments / tool raises | controlled `{success: false, error}`, model explains it |
+| retrieval returns nothing | "not enough information in the documents" — never an invented answer |
+| step limit exceeded | graph stops, controlled answer, reason logged |
+| inference service unreachable | `502` — the turn is not faked with a misleading answer |
+
+### Example
+
+```bash
+CONV=$(curl -s -X POST http://127.0.0.1:8000/conversations \
+        -H "Content-Type: application/json" \
+        -d '{"title": "Агент"}' | jq -r .id)
+
+curl -s -X POST http://127.0.0.1:8000/conversations/$CONV/agent \
+  -H "Content-Type: application/json" \
+  -d '{"content": "Сколько будет 17 * 23?"}' | jq
+```
+
+```json
+{
+  "message": {
+    "id": "…",
+    "conversation_id": "…",
+    "role": "assistant",
+    "content": "17 умножить на 23 равно 391.",
+    "created_at": "2026-09-07T12:24:55Z"
+  },
+  "route": "tool",
+  "tools_used": [{"name": "calculator", "success": true, "error": null}],
+  "sources": []
+}
+```
+
+Grounded question over a document:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/conversations/$CONV/agent \
+  -H "Content-Type: application/json" \
+  -d '{
+        "content": "Кто руководит проектом Борей?",
+        "use_rag": true,
+        "document_ids": ["<document_id>"]
+      }' | jq '{route, sources: (.sources | length), answer: .message.content}'
+```
+
+```json
+{
+  "route": "rag_search",
+  "sources": 2,
+  "answer": "Руководитель проекта Борей — Павел Семёнов … [SOURCE 1]"
+}
+```
+
+`use_rag` is a hint, not a command: the agent may still route elsewhere, and the
+flag decides the safe default when routing cannot be trusted.
+
+### What the response never contains
+
+Only the answer, the chosen route, tool names with success/error metadata, and
+sources. Prompts, the router's rationale and any intermediate state stay
+server-side. The database keeps plain `user` / `assistant` messages only — the
+agent's internal state is never written to a `Message` row.
+
+---
+
 ## Configuration
 
 All settings come from environment variables (or `.env`); see `.env.example`.
@@ -482,6 +647,11 @@ All settings come from environment variables (or `.env`); see `.env.example`.
 | `RAG_TOP_K` | `5` | chunks kept after reranking |
 | `RAG_CANDIDATE_K` | `15` | chunks fetched from Qdrant before reranking |
 | `CHAT_HISTORY_LIMIT` | `20` | messages replayed to the model |
+| `AGENT_MAX_STEPS` | `6` | hard ceiling on graph nodes per run |
+| `AGENT_ROUTER_TEMPERATURE` | `0.0` | structured calls want determinism |
+| `AGENT_STRUCTURED_REPAIR_ATTEMPTS` | `1` | JSON repair round trips; `0` disables |
+| `AGENT_STRUCTURED_MAX_TOKENS` | `300` | budget for routing / tool selection |
+| `AGENT_ANSWER_MAX_TOKENS` | `600` | budget for the composed answer |
 | `MAX_UPLOAD_SIZE_MB` | `25` | upload size limit (`413` above it) |
 | `EMBEDDING_MODEL` | `intfloat/multilingual-e5-small` | encoder |
 | `RERANKER_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | cross-encoder |
@@ -515,10 +685,22 @@ Structured logs per ingestion stage (`load`, `read_source`, `parse`, `chunk`,
 document_stage stage=embed document_id=0f1a… task_id=8f2b… duration_ms=4180.2 vectors=48
 ```
 
+Agent runs log the same way — identifiers, route, tool name, step and duration,
+never the user's message or the prompts:
+
+```
+agent_started   conversation_id=30d9c013… history=1 scoped=False use_rag=False
+agent_routed    conversation_id=30d9c013… duration_ms=2734.4 route=tool step=1 tool_name=calculator
+agent_tool_completed conversation_id=30d9c013… duration_ms=2085.1 step=2 success=True tool_name=calculator
+agent_completed conversation_id=30d9c013… duration_ms=5697.3 errors=0 route=tool sources=0 step=3 tools=1
+```
+
 Prometheus metrics — `documents_processing_total`,
 `document_processing_failures_total{reason}`,
-`document_processing_duration_seconds{outcome}` and
-`document_processing_stage_seconds{stage}`:
+`document_processing_duration_seconds{outcome}`,
+`document_processing_stage_seconds{stage}`, plus
+`agent_requests_total{route,status}`, `agent_duration_seconds` and
+`agent_tool_calls_total{tool,status}`:
 
 ```bash
 curl -s http://127.0.0.1:8000/metrics | grep document_processing
@@ -604,7 +786,17 @@ alembic check                    # models and migrations agree
 Unit tests never touch the network: the models, Qdrant, Redis, RabbitMQ and the
 inference service are replaced by in-process fakes, and PostgreSQL by in-memory
 SQLite. The Celery task body is tested by calling it directly with those fakes,
-and its retry policy in Celery's eager mode — no broker is needed.
+and its retry policy in Celery's eager mode — no broker is needed. Agent tests
+script the fake inference client's replies, so routing, tool calling and every
+fallback path run without a model.
+
+The agent integration tests drive the live HTTP API (routing runs on the real
+local Gemma). They skip themselves when the backend or the inference service is
+not up, and `BACKEND_URL` overrides the target:
+
+```bash
+pytest -m integration -o addopts=""
+```
 
 New migration after changing `backend/models.py`:
 
@@ -642,3 +834,21 @@ alembic upgrade head
   for caching or rate limiting.
 - **Deleting a document does not rewrite history.** Past assistant messages keep
   the answers that were grounded on it.
+- **The agent takes one tool per turn.** The graph is a fixed DAG, so it cannot
+  chain a search into a calculation. Multi-step plans would need a new node and
+  an edge back into the tool step — and that is exactly what `AGENT_MAX_STEPS`
+  is there to bound.
+- **Routing quality is bounded by a 4B local model.** It is right on clear-cut
+  questions (see the smoke tests) but can misroute ambiguous ones. Every
+  misroute degrades to a safe branch rather than failing.
+- **Routing costs an extra LLM round trip.** An agent turn is one call slower
+  than `POST /conversations/{id}/messages`; on this hardware the router adds
+  ~3 s. Use the plain endpoint when you already know you want RAG.
+- **`langchain-core` comes along with LangGraph.** It is a hard dependency of
+  `langgraph`, not a choice; no LangChain chains, agents or LLM wrappers are
+  used. `websockets` is pinned to `16.1.1` because `langgraph-sdk` requires
+  `<17`; the project has no WebSocket routes, so nothing depends on the newer
+  release.
+- **No agent tracing UI.** LangSmith is installed transitively but not
+  configured, and no checkpointer is attached — the graph is stateless between
+  turns and memory comes from the `messages` table.

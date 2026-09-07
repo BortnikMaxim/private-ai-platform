@@ -67,6 +67,13 @@ class TransientProcessingError(AppError):
     default_detail = "Temporary processing failure"
 
 
+class AgentUnavailableError(AppError):
+    """The agent layer is not wired up in this deployment."""
+
+    status_code = 503
+    default_detail = "Agent orchestration is not available"
+
+
 class DocumentGoneError(AppError):
     """The document disappeared mid-processing (deleted by a concurrent request)."""
 

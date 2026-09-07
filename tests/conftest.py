@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from backend import dependencies as deps
+from backend.agent.graph import AgentService
+from backend.agent.tools.registry import ToolRegistry, default_registry
 from backend.app import create_app
 from backend.config import Settings
 from backend.db import Base, get_db
@@ -153,6 +155,11 @@ class FakeInferenceClient:
         self.answer = answer
         self.calls: list[list[dict[str, str]]] = []
         self.available = True
+        # Scripted replies, consumed in order; falls back to `answer` when empty.
+        self.responses: list[str] = []
+
+    def script(self, *responses: str) -> None:
+        self.responses.extend(responses)
 
     async def health(self) -> bool:
         return self.available
@@ -170,6 +177,9 @@ class FakeInferenceClient:
 
         if not self.available:
             raise InferenceUnavailableError()
+
+        if self.responses:
+            return self.responses.pop(0)
 
         return self.answer
 
@@ -331,10 +341,33 @@ def document_processor(embeddings, vector_store, storage, settings) -> DocumentP
 
 
 @pytest.fixture
+def tool_registry() -> ToolRegistry:
+    return default_registry()
+
+
+@pytest.fixture
+def agent_service(
+    inference,
+    rag_service,
+    document_service,
+    tool_registry,
+    settings,
+) -> AgentService:
+    return AgentService(
+        inference=inference,
+        rag=rag_service,
+        documents=document_service,
+        registry=tool_registry,
+        settings=settings,
+    )
+
+
+@pytest.fixture
 def conversation_service(
     inference,
     rag_service,
     document_service,
+    agent_service,
     settings,
 ) -> ConversationService:
     return ConversationService(
@@ -342,6 +375,7 @@ def conversation_service(
         rag=rag_service,
         documents=document_service,
         settings=settings,
+        agent=agent_service,
     )
 
 

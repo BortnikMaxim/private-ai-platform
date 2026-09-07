@@ -2,8 +2,11 @@ import uuid
 
 from fastapi import APIRouter, Query, status
 
+from backend.agent.state import tools_used as summarize_tools
 from backend.dependencies import ConversationServiceDep, DbSession
 from backend.schemas import (
+    AgentMessageCreate,
+    AgentMessageResponse,
     ConversationCreate,
     ConversationDetailResponse,
     ConversationListResponse,
@@ -12,6 +15,7 @@ from backend.schemas import (
     MessageCreate,
     MessageRead,
     MessageResponse,
+    ToolUsed,
     to_source,
 )
 
@@ -116,4 +120,40 @@ async def create_message(
         message=MessageRead.model_validate(message),
         used_rag=payload.use_rag,
         sources=[to_source(chunk) for chunk in sources],
+    )
+
+
+@router.post(
+    "/{conversation_id}/agent",
+    response_model=AgentMessageResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_agent_message(
+    conversation_id: uuid.UUID,
+    payload: AgentMessageCreate,
+    session: DbSession,
+    conversations: ConversationServiceDep,
+) -> AgentMessageResponse:
+    """Answer a turn through the agent graph.
+
+    The agent classifies the request and takes one of four branches: answering
+    directly, searching the document base, calling a whitelisted tool, or a
+    safe fallback. It is a fixed state machine, not an autonomous loop.
+
+    ``POST /conversations/{id}/messages`` remains the plain chat/RAG path and is
+    unaffected.
+    """
+    message, state = await conversations.run_agent_turn(
+        session,
+        conversation_id=conversation_id,
+        content=payload.content,
+        use_rag=payload.use_rag,
+        document_ids=payload.document_ids,
+    )
+
+    return AgentMessageResponse(
+        message=MessageRead.model_validate(message),
+        route=state.get("route") or "fallback",
+        tools_used=[ToolUsed(**entry) for entry in summarize_tools(state)],
+        sources=[to_source(chunk) for chunk in state.get("retrieved_sources", [])],
     )

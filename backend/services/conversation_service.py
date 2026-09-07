@@ -9,7 +9,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import Settings
-from backend.errors import ConversationNotFoundError, DocumentNotFoundError
+from backend.errors import (
+    AgentUnavailableError,
+    ConversationNotFoundError,
+    DocumentNotFoundError,
+)
 from backend.models import Conversation, Message
 from backend.prompts import CHAT_SYSTEM_PROMPT, GROUNDED_SYSTEM_PROMPT
 from backend.services.document_service import DocumentService
@@ -28,11 +32,14 @@ class ConversationService:
         rag: RagService,
         documents: DocumentService,
         settings: Settings,
+        agent: Any = None,
     ) -> None:
         self.inference = inference
         self.rag = rag
         self.documents = documents
         self.settings = settings
+        # Optional so the plain chat/RAG paths keep working without an agent.
+        self.agent = agent
 
     # -- CRUD ------------------------------------------------------------
 
@@ -190,6 +197,72 @@ class ConversationService:
         await session.refresh(assistant_message)
 
         return assistant_message, sources
+
+    # -- agent turn -------------------------------------------------------
+
+    async def run_agent_turn(
+        self,
+        session: AsyncSession,
+        conversation_id: uuid.UUID,
+        content: str,
+        use_rag: bool = True,
+        document_ids: list[uuid.UUID] | None = None,
+    ) -> tuple[Message, dict[str, Any]]:
+        """Persist the user turn, run the agent graph, persist the answer.
+
+        Only the final assistant text reaches the database — the agent's
+        internal state, routing rationale and tool payloads never become
+        Message rows.
+        """
+        if self.agent is None:
+            raise AgentUnavailableError()
+
+        conversation = await self.get(session, conversation_id)
+
+        if document_ids:
+            await self._assert_documents_exist(session, document_ids)
+
+        user_message = Message(
+            conversation_id=conversation.id,
+            role="user",
+            content=content,
+        )
+        session.add(user_message)
+        await session.commit()
+
+        history = await self.get_messages(
+            session,
+            conversation_id,
+            limit=self.settings.chat_history_limit,
+        )
+
+        state = await self.agent.run(
+            conversation_id=conversation_id,
+            user_message=content,
+            chat_history=[
+                {"role": message.role, "content": message.content}
+                for message in history
+                if message.role in HISTORY_ROLES
+            ],
+            use_rag=use_rag,
+            document_ids=[str(value) for value in document_ids or []] or None,
+            session=session,
+        )
+
+        assistant_message = Message(
+            conversation_id=conversation.id,
+            role="assistant",
+            content=state.get("final_answer", ""),
+        )
+        session.add(assistant_message)
+
+        conversation.updated_at = datetime.now(UTC)
+        session.add(conversation)
+
+        await session.commit()
+        await session.refresh(assistant_message)
+
+        return assistant_message, state
 
     def _build_llm_messages(
         self,

@@ -39,6 +39,45 @@ DOCUMENT_PROCESSING_STAGE_SECONDS = Histogram(
     buckets=(0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 300),
 )
 
+# --- agent -----------------------------------------------------------------
+
+AGENT_REQUESTS_TOTAL = Counter(
+    "agent_requests_total",
+    "Agent runs by chosen route and outcome",
+    ["route", "status"],
+)
+
+AGENT_DURATION_SECONDS = Histogram(
+    "agent_duration_seconds",
+    "End to end agent run duration",
+    buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120),
+)
+
+AGENT_TOOL_CALLS_TOTAL = Counter(
+    "agent_tool_calls_total",
+    "Tool invocations by tool and outcome",
+    ["tool", "status"],
+)
+
+agent_logger = logging.getLogger("backend.agent")
+
+
+def agent_event(event: str, conversation_id: str, **fields: object) -> None:
+    """Structured agent log line.
+
+    Only identifiers, names, counts and durations — never the user message,
+    document text, prompts or credentials.
+    """
+    details = " ".join(
+        f"{key}={value}" for key, value in sorted(fields.items()) if value is not None
+    )
+    agent_logger.info(
+        "%s conversation_id=%s%s",
+        event,
+        conversation_id,
+        f" {details}" if details else "",
+    )
+
 
 @contextmanager
 def stage(name: str, document_id: str, task_id: str | None = None) -> Iterator[dict]:

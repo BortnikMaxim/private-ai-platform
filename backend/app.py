@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from qdrant_client import AsyncQdrantClient
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from backend.agent.graph import AgentService
+from backend.agent.tools.registry import default_registry
 from backend.api import conversations, documents, health, rag
 from backend.config import Settings
 from backend.config import settings as default_settings
@@ -114,11 +116,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         task_dispatcher = CeleryTaskDispatcher()
 
+        tool_registry = default_registry()
+
+        agent_service = AgentService(
+            inference=inference_client,
+            rag=rag_service,
+            documents=document_service,
+            registry=tool_registry,
+            settings=settings,
+        )
+
         conversation_service = ConversationService(
             inference=inference_client,
             rag=rag_service,
             documents=document_service,
             settings=settings,
+            agent=agent_service,
         )
 
         app.state.engine = db_engine
@@ -137,6 +150,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.document_service = document_service
         app.state.document_processor = document_processor
         app.state.conversation_service = conversation_service
+        app.state.tool_registry = tool_registry
+        app.state.agent_service = agent_service
         app.state.broker = broker
         app.state.task_dispatcher = task_dispatcher
 
