@@ -43,6 +43,14 @@ class HealthResponse(BaseModel):
     redis: str
     qdrant: str
     inference: str
+    rabbitmq: str
+
+
+class WorkerHealthResponse(BaseModel):
+    """Result of a broadcast ping; slower than /health, hence a separate route."""
+
+    workers: list[str]
+    available: bool
 
 
 # ---------------------------------------------------------------------------
@@ -63,12 +71,21 @@ class DocumentRead(BaseModel):
     extracted_pages: int
     chunks_count: int
     error_message: str | None = None
+    celery_task_id: str | None = None
     created_at: datetime
 
 
 class DocumentListResponse(BaseModel):
     items: list[DocumentRead]
     total: int
+
+
+class DocumentAcceptedResponse(BaseModel):
+    """202 body: the upload was stored and queued, nothing is indexed yet."""
+
+    document_id: uuid.UUID
+    status: str = "processing"
+    task_id: str | None = None
 
 
 class DocumentChunkRead(BaseModel):

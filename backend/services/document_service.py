@@ -1,11 +1,15 @@
-"""Document ingestion: validate -> parse -> chunk -> embed -> store."""
+"""Document CRUD and the synchronous half of ingestion.
 
-import asyncio
+The API only does cheap work here — validate the upload, persist the bytes and
+record a ``processing`` row. Parsing, embedding and indexing happen in a Celery
+worker; see :mod:`backend.services.document_processor`.
+"""
+
 import logging
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 from fastapi import UploadFile
 from sqlalchemy import func, select, update
@@ -14,16 +18,17 @@ from sqlalchemy.orm import selectinload
 
 from backend.config import Settings
 from backend.errors import (
-    AppError,
     DocumentNotFoundError,
     FileTooLargeError,
     InvalidDocumentError,
     VectorStoreError,
 )
-from backend.models import Document, DocumentChunk
-from backend.services.chunking import build_chunks, extract_pdf_pages
-from backend.services.embeddings import EmbeddingService
+from backend.models import Document
+from backend.services.storage import DocumentStorage
 from backend.services.vector_store import VectorStore
+
+if TYPE_CHECKING:
+    from backend.services.task_queue import TaskDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +55,12 @@ def sanitize_filename(name: str) -> str:
 class DocumentService:
     def __init__(
         self,
-        embeddings: EmbeddingService,
         vector_store: VectorStore,
+        storage: DocumentStorage,
         settings: Settings,
     ) -> None:
-        self.embeddings = embeddings
         self.vector_store = vector_store
+        self.storage = storage
         self.settings = settings
 
     # -- queries ---------------------------------------------------------
@@ -151,11 +156,16 @@ class DocumentService:
 
         return bytes(buffer)
 
-    async def ingest(
+    async def create_pending(
         self,
         session: AsyncSession,
         upload: UploadFile,
     ) -> Document:
+        """Validate and persist an upload, then record it as ``processing``.
+
+        Everything here is cheap and bounded: the request never waits for
+        parsing or embedding. The heavy work is picked up by a Celery worker.
+        """
         file_bytes = await self.read_upload(upload)
         original_filename = upload.filename or "document.pdf"
 
@@ -171,132 +181,36 @@ class DocumentService:
         await session.commit()
         await session.refresh(document)
 
-        document_id = document.id
-        logger.info(
-            "document_ingest_started document_id=%s size_bytes=%d",
-            document_id,
-            len(file_bytes),
-        )
-
         try:
-            return await self._process(session, document, file_bytes)
-
-        except AppError as exc:
-            await self._mark_failed(session, document_id, exc.detail)
-            raise
-
-        except Exception as exc:
-            # Never leak internals to the caller; the traceback goes to the log.
-            logger.exception("document_ingest_failed document_id=%s", document_id)
-            await self._mark_failed(session, document_id, "Internal ingestion error")
-            raise AppError("Document ingestion failed") from exc
-
-    async def _process(
-        self,
-        session: AsyncSession,
-        document: Document,
-        file_bytes: bytes,
-    ) -> Document:
-        total_pages, pages = await asyncio.to_thread(extract_pdf_pages, file_bytes)
-
-        records = build_chunks(
-            pages,
-            chunk_size=self.settings.chunk_size_words,
-            overlap=self.settings.chunk_overlap_words,
-        )
-
-        if not records:
-            raise InvalidDocumentError("No text could be extracted from the PDF")
-
-        vectors = await self.embeddings.embed_passages(
-            [record["text"] for record in records]
-        )
-
-        document_id = str(document.id)
-        point_records: list[dict[str, Any]] = []
-
-        for record, vector in zip(records, vectors, strict=True):
-            point_records.append(
-                {
-                    "point_id": str(uuid.uuid4()),
-                    "vector": vector,
-                    "document_id": document_id,
-                    "filename": document.filename,
-                    "page": record["page"],
-                    "chunk_index": record["chunk_index"],
-                    "text": record["text"],
-                }
-            )
-
-        await self.vector_store.upsert_chunks(point_records)
-
-        try:
-            session.add_all(
-                [
-                    DocumentChunk(
-                        document_id=document.id,
-                        qdrant_point_id=record["point_id"],
-                        page=record["page"],
-                        chunk_index=record["chunk_index"],
-                        text=record["text"],
-                    )
-                    for record in point_records
-                ]
-            )
-
-            document.status = "ready"
-            document.total_pages = total_pages
-            document.extracted_pages = len(pages)
-            document.chunks_count = len(point_records)
-            document.error_message = None
-
-            await session.commit()
-
+            await self.storage.save(document.id, file_bytes)
         except Exception:
-            # Roll the vectors back so Qdrant never outlives its metadata.
-            await session.rollback()
-            await self._safe_delete_vectors(document_id)
+            # Without its source file the document could never be processed,
+            # so do not leave a permanently stuck row behind.
+            logger.exception("document_source_store_failed document_id=%s", document.id)
+            await session.delete(document)
+            await session.commit()
             raise
 
-        await session.refresh(document)
-
         logger.info(
-            "document_ingest_finished document_id=%s pages=%d chunks=%d",
-            document_id,
-            len(pages),
-            len(point_records),
+            "document_accepted document_id=%s size_bytes=%d",
+            document.id,
+            len(file_bytes),
         )
 
         return document
 
-    async def _mark_failed(
+    async def attach_task(
         self,
         session: AsyncSession,
         document_id: uuid.UUID,
-        error_message: str,
+        task_id: str,
     ) -> None:
-        await session.rollback()
-
-        try:
-            await session.execute(
-                update(Document)
-                .where(Document.id == document_id)
-                .values(status="failed", error_message=error_message[:1000])
-            )
-            await session.commit()
-        except Exception:
-            logger.exception(
-                "document_status_update_failed document_id=%s", document_id
-            )
-            await session.rollback()
-
-        await self._safe_delete_vectors(str(document_id))
-
-    async def _safe_delete_vectors(self, document_id: str) -> None:
-        try:
-            await self.vector_store.delete_document(document_id)
-        except Exception:
-            logger.exception("vector_cleanup_failed document_id=%s", document_id)
+        await session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(celery_task_id=task_id)
+        )
+        await session.commit()
 
     # -- delete ----------------------------------------------------------
 
@@ -304,8 +218,22 @@ class DocumentService:
         self,
         session: AsyncSession,
         document_id: uuid.UUID,
+        dispatcher: "TaskDispatcher | None" = None,
     ) -> None:
+        """Delete a document, whether or not a worker is still processing it.
+
+        Ordering matters. The row is removed *last* but its disappearance is
+        what stops an in-flight task: every heavy stage re-checks that the
+        document still exists, and the final persist step refuses to write
+        results for a row that is gone. Revoking the task is best effort on top
+        of that — a worker that already dequeued the job ignores a revoke.
+        """
         document = await self.get_document(session, document_id)
+        was_processing = document.status == "processing"
+        task_id = document.celery_task_id
+
+        if dispatcher is not None and was_processing and task_id:
+            dispatcher.revoke(task_id)
 
         # Remove the vectors first: orphaned rows are recoverable, orphaned
         # vectors would keep showing up in retrieval results.
@@ -321,4 +249,11 @@ class DocumentService:
         await session.delete(document)
         await session.commit()
 
-        logger.info("document_deleted document_id=%s", document_id)
+        await self.storage.safe_delete(document_id)
+
+        logger.info(
+            "document_deleted document_id=%s was_processing=%s task_id=%s",
+            document_id,
+            was_processing,
+            task_id,
+        )

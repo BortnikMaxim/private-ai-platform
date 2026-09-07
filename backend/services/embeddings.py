@@ -7,6 +7,7 @@ libraries are imported lazily inside :meth:`EmbeddingService.load`.
 
 import asyncio
 import logging
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,11 @@ class EmbeddingService:
 
         self._encoder: Any = None
         self._reranker: Any = None
-        self._lock = asyncio.Lock()
+        # A threading.Lock rather than an asyncio.Lock on purpose: a Celery
+        # worker runs each task in its own `asyncio.run` loop, and an
+        # asyncio.Lock binds to the first loop that uses it. This keeps one
+        # instance reusable across loops, and across threads.
+        self._lock = threading.Lock()
 
     # -- lifecycle -------------------------------------------------------
 
@@ -28,26 +33,30 @@ class EmbeddingService:
         return self._encoder is not None and self._reranker is not None
 
     def load(self) -> None:
-        """Blocking model load. Call through :meth:`ensure_loaded`."""
-        from sentence_transformers import CrossEncoder, SentenceTransformer
+        """Blocking, thread safe model load. Call through :meth:`ensure_loaded`."""
+        with self._lock:
+            if self.is_loaded:
+                return
 
-        if self._encoder is None:
-            logger.info("loading embedding model: %s", self.embedding_model_name)
-            self._encoder = SentenceTransformer(self.embedding_model_name)
+            from sentence_transformers import CrossEncoder, SentenceTransformer
 
-        if self._reranker is None:
-            logger.info("loading reranker model: %s", self.reranker_model_name)
-            self._reranker = CrossEncoder(self.reranker_model_name)
+            if self._encoder is None:
+                logger.info("loading embedding model: %s", self.embedding_model_name)
+                self._encoder = SentenceTransformer(self.embedding_model_name)
 
-        logger.info("embedding and reranker models are ready")
+            if self._reranker is None:
+                logger.info("loading reranker model: %s", self.reranker_model_name)
+                self._reranker = CrossEncoder(self.reranker_model_name)
+
+            logger.info("embedding and reranker models are ready")
 
     async def ensure_loaded(self) -> None:
         if self.is_loaded:
             return
 
-        async with self._lock:
-            if not self.is_loaded:
-                await asyncio.to_thread(self.load)
+        # Concurrent callers all reach the thread, but load() itself only runs
+        # the import and construction once.
+        await asyncio.to_thread(self.load)
 
     # -- embeddings ------------------------------------------------------
 

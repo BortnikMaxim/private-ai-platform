@@ -23,8 +23,10 @@ from backend.config import Settings
 from backend.db import Base, get_db
 from backend.errors import InferenceUnavailableError
 from backend.services.conversation_service import ConversationService
+from backend.services.document_processor import DocumentProcessor
 from backend.services.document_service import DocumentService
 from backend.services.rag_service import RagService
+from backend.services.storage import DocumentStorage
 
 VECTOR_SIZE = 8
 
@@ -185,13 +187,45 @@ class FakeRedis:
         return None
 
 
+class FakeTaskDispatcher:
+    """Records enqueues instead of talking to RabbitMQ."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, str]] = []
+        self.revoked: list[str] = []
+        self.fail_on_enqueue = False
+
+    def enqueue_document_processing(self, document_id) -> str:
+        if self.fail_on_enqueue:
+            raise RuntimeError("broker is unreachable")
+
+        task_id = str(uuid.uuid4())
+        self.enqueued.append((str(document_id), task_id))
+        return task_id
+
+    def revoke(self, task_id: str) -> None:
+        self.revoked.append(task_id)
+
+
+class FakeBroker:
+    def __init__(self) -> None:
+        self.available = True
+        self.workers = ["celery@test"]
+
+    async def health(self) -> bool:
+        return self.available
+
+    async def ping_workers(self) -> list[str]:
+        return list(self.workers) if self.available else []
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def settings() -> Settings:
+def settings(tmp_path) -> Settings:
     return Settings(
         database_url="sqlite+aiosqlite:///:memory:",
         inference_api_key="test-key",
@@ -203,6 +237,7 @@ def settings() -> Settings:
         max_upload_size_mb=1,
         chunk_size_words=25,
         chunk_overlap_words=5,
+        upload_dir=tmp_path / "uploads",
     )
 
 
@@ -255,15 +290,42 @@ def redis_client() -> FakeRedis:
 
 
 @pytest.fixture
+def task_dispatcher() -> FakeTaskDispatcher:
+    return FakeTaskDispatcher()
+
+
+@pytest.fixture
+def broker() -> FakeBroker:
+    return FakeBroker()
+
+
+@pytest.fixture
+def storage(settings) -> DocumentStorage:
+    store = DocumentStorage(settings.upload_dir)
+    store.ensure_ready()
+    return store
+
+
+@pytest.fixture
 def rag_service(embeddings, vector_store, settings) -> RagService:
     return RagService(embeddings=embeddings, vector_store=vector_store, settings=settings)
 
 
 @pytest.fixture
-def document_service(embeddings, vector_store, settings) -> DocumentService:
+def document_service(vector_store, storage, settings) -> DocumentService:
     return DocumentService(
+        vector_store=vector_store,
+        storage=storage,
+        settings=settings,
+    )
+
+
+@pytest.fixture
+def document_processor(embeddings, vector_store, storage, settings) -> DocumentProcessor:
+    return DocumentProcessor(
         embeddings=embeddings,
         vector_store=vector_store,
+        storage=storage,
         settings=settings,
     )
 
@@ -293,7 +355,10 @@ def app(
     inference,
     rag_service,
     document_service,
+    document_processor,
     conversation_service,
+    task_dispatcher,
+    broker,
 ):
     application = create_app(settings=settings)
 
@@ -307,14 +372,20 @@ def app(
 
     application.dependency_overrides[get_db] = override_get_db
     application.dependency_overrides[deps.get_engine] = lambda: db_engine
+    application.dependency_overrides[deps.get_session_factory] = lambda: session_factory
     application.dependency_overrides[deps.get_redis] = lambda: redis_client
     application.dependency_overrides[deps.get_vector_store] = lambda: vector_store
     application.dependency_overrides[deps.get_inference_client] = lambda: inference
     application.dependency_overrides[deps.get_rag_service] = lambda: rag_service
     application.dependency_overrides[deps.get_document_service] = lambda: document_service
+    application.dependency_overrides[deps.get_document_processor] = (
+        lambda: document_processor
+    )
     application.dependency_overrides[deps.get_conversation_service] = (
         lambda: conversation_service
     )
+    application.dependency_overrides[deps.get_task_dispatcher] = lambda: task_dispatcher
+    application.dependency_overrides[deps.get_broker] = lambda: broker
 
     return application
 

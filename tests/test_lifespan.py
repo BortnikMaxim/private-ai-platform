@@ -113,7 +113,13 @@ async def test_startup_populates_state_and_shutdown_closes_everything(
         assert state.vector_store.client is mocked_resources["qdrant"]
         assert state.rag_service is not None
         assert state.document_service is not None
+        assert state.document_processor is not None
         assert state.conversation_service is not None
+        assert state.broker is not None
+        assert state.task_dispatcher is not None
+
+        # The upload directory is created up front, not on the first request.
+        assert state.storage.base_dir.is_dir()
 
         # The collection is checked exactly once, at startup.
         assert mocked_resources["qdrant"].collection_exists_calls == 1

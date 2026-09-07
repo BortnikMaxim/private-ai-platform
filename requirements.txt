@@ -1,9 +1,12 @@
 alembic==1.19.2
+amqp==5.3.1
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
 async-timeout==5.0.1
 asyncpg==0.31.0
+billiard==4.2.4
+celery==5.6.3
 certifi==2026.7.22
 cffi==2.1.1
 charset-normalizer==3.5.1
@@ -26,6 +29,7 @@ hyperframe==6.1.0
 idna==3.19
 Jinja2==3.1.6
 joblib==1.6.0
+kombu==5.6.2
 llguidance==1.8.0
 Mako==1.4.1
 markdown-it-py==4.2.0
@@ -83,5 +87,6 @@ typing_extensions==4.16.0
 urllib3==2.7.0
 uvicorn==0.52.4
 uvloop==0.22.1
+vine==5.1.0
 watchfiles==1.2.0
 websockets==17.1

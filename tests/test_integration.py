@@ -29,6 +29,58 @@ EXPECTED_TABLES = {
 }
 
 
+async def test_rabbitmq_is_reachable():
+    from backend.services.broker import BrokerClient
+
+    settings = get_settings()
+    broker = BrokerClient(settings.celery_broker_url, health_timeout=3.0)
+
+    if not await broker.health():
+        pytest.skip(f"RabbitMQ is not reachable at {settings.celery_broker_url}")
+
+    assert await broker.health() is True
+
+
+async def test_celery_can_publish_to_the_real_broker():
+    """Publish a task and read it back off the queue without a worker running."""
+    import kombu
+
+    from backend.worker.celery_app import celery_app
+
+    settings = get_settings()
+    queue_name = f"itest_{uuid.uuid4().hex[:8]}"
+
+    try:
+        connection = kombu.Connection(settings.celery_broker_url, connect_timeout=3)
+        connection.ensure_connection(max_retries=0, timeout=3)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"RabbitMQ is not reachable: {exc}")
+
+    document_id = str(uuid.uuid4())
+
+    try:
+        celery_app.send_task(
+            "documents.process",
+            args=[document_id],
+            queue=queue_name,
+        )
+
+        with connection as conn:
+            queue = kombu.Queue(queue_name, channel=conn)
+            message = queue.get(no_ack=True, accept=["json"])
+
+            assert message is not None, "the task never reached the broker"
+
+            body, _headers, _properties = message.body, message.headers, message.properties
+            # Only the id travels over AMQP — never the PDF bytes.
+            assert document_id in str(body)
+            assert message.headers["task"] == "documents.process"
+
+            queue.delete()
+    finally:
+        connection.release()
+
+
 async def test_postgres_schema_matches_the_models():
     engine = create_engine()
 

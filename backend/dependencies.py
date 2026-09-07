@@ -10,14 +10,17 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from backend.config import Settings, get_settings
 from backend.db import get_db
+from backend.services.broker import BrokerClient
 from backend.services.conversation_service import ConversationService
+from backend.services.document_processor import DocumentProcessor
 from backend.services.document_service import DocumentService
 from backend.services.inference_client import InferenceClient
 from backend.services.rag_service import RagService
+from backend.services.task_queue import TaskDispatcher
 from backend.services.vector_store import VectorStore
 
 
@@ -49,6 +52,22 @@ def get_conversation_service(request: Request) -> ConversationService:
     return request.app.state.conversation_service
 
 
+def get_document_processor(request: Request) -> DocumentProcessor:
+    return request.app.state.document_processor
+
+
+def get_task_dispatcher(request: Request) -> TaskDispatcher:
+    return request.app.state.task_dispatcher
+
+
+def get_broker(request: Request) -> BrokerClient:
+    return request.app.state.broker
+
+
+def get_session_factory(request: Request) -> async_sessionmaker:
+    return request.app.state.session_factory
+
+
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 EngineDep = Annotated[AsyncEngine, Depends(get_engine)]
@@ -60,3 +79,7 @@ DocumentServiceDep = Annotated[DocumentService, Depends(get_document_service)]
 ConversationServiceDep = Annotated[
     ConversationService, Depends(get_conversation_service)
 ]
+DocumentProcessorDep = Annotated[DocumentProcessor, Depends(get_document_processor)]
+TaskDispatcherDep = Annotated[TaskDispatcher, Depends(get_task_dispatcher)]
+BrokerDep = Annotated[BrokerClient, Depends(get_broker)]
+SessionFactoryDep = Annotated[async_sessionmaker, Depends(get_session_factory)]

@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -61,6 +62,33 @@ class Settings(BaseSettings):
 
     # --- uploads ---------------------------------------------------------
     max_upload_size_mb: int = Field(default=25, ge=1, le=500)
+    # Where uploaded PDFs live until a worker has ingested them. Relative paths
+    # are resolved against the process working directory.
+    upload_dir: Path = Path("data/uploads")
+    # Drop the source PDF once its chunks are indexed. Turn off to keep the
+    # originals for re-processing.
+    delete_source_after_processing: bool = True
+
+    # --- Celery / RabbitMQ -----------------------------------------------
+    celery_broker_url: str = (
+        "amqp://privateai:privateai_dev_password@127.0.0.1:5672//"
+    )
+    celery_result_backend: str = "redis://127.0.0.1:6379/1"
+    celery_task_queue: str = "documents"
+    # Hard/soft limits for a single ingestion task.
+    celery_task_soft_time_limit: int = Field(default=1500, ge=30)
+    celery_task_time_limit: int = Field(default=1800, ge=60)
+    # Retry policy for transient failures (Qdrant or PostgreSQL hiccups).
+    celery_max_retries: int = Field(default=5, ge=0, le=20)
+    celery_retry_backoff_seconds: int = Field(default=5, ge=1)
+    celery_retry_backoff_max_seconds: int = Field(default=300, ge=1)
+    # Run tasks inline instead of dispatching them. Tests only.
+    celery_task_always_eager: bool = False
+    broker_health_timeout_seconds: float = Field(default=2.0, gt=0)
+    worker_ping_timeout_seconds: float = Field(default=1.0, gt=0)
+    # 0 disables the worker's Prometheus HTTP server. Only meaningful for a
+    # single-process pool (solo/threads); see README.
+    worker_metrics_port: int = Field(default=0, ge=0, le=65535)
 
     @property
     def max_upload_size_bytes(self) -> int:

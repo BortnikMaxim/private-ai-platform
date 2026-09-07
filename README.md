@@ -6,10 +6,12 @@ served by a local Gemma model through MLX on Apple Silicon.
 
 - **Backend** — FastAPI service (`http://127.0.0.1:8000`) with documents,
   conversations and RAG APIs.
+- **Celery worker** — ingests uploaded PDFs in the background. Runs **natively**
+  next to the backend, because it loads the embedding models.
 - **Inference service** — separate FastAPI service (`http://127.0.0.1:8001`)
   wrapping `mlx-community/gemma-3-4b-it-qat-4bit` via MLX-VLM. Runs **natively**
   on the host, never in Docker, because it needs Metal access.
-- **PostgreSQL / Redis / Qdrant** — run in Docker Compose.
+- **PostgreSQL / Redis / Qdrant / RabbitMQ** — run in Docker Compose.
 
 ---
 
@@ -22,9 +24,17 @@ flowchart TD
     Client -->|HTTP :8000| Backend[Backend FastAPI]
 
     Backend --> Postgres[(PostgreSQL 16<br/>users, conversations,<br/>messages, documents, chunks)]
-    Backend --> Redis[(Redis<br/>cache / health)]
+    Backend --> Redis[(Redis<br/>cache, Celery results)]
     Backend --> Qdrant[(Qdrant<br/>vector collection 'documents')]
     Backend -->|X-API-Key, :8001| Inference[Inference API FastAPI]
+    Backend -->|enqueue document_id| Rabbit[(RabbitMQ<br/>queue 'documents')]
+    Backend -->|write PDF| Files[/data/uploads/]
+
+    Rabbit -->|consume| Worker[Celery worker]
+    Worker -->|read PDF| Files
+    Worker --> Postgres
+    Worker --> Qdrant
+    Worker --> Redis
 
     Inference --> MLX[MLX / MLX-VLM<br/>gemma-3-4b-it-qat-4bit]
 
@@ -32,12 +42,48 @@ flowchart TD
         Postgres
         Redis
         Qdrant
+        Rabbit
     end
 
     subgraph "Native host (Apple Silicon)"
+        Backend
+        Worker
         Inference
         MLX
     end
+```
+
+### Document ingestion flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Backend
+    participant F as data/uploads
+    participant P as PostgreSQL
+    participant R as RabbitMQ
+    participant W as Celery worker
+    participant Q as Qdrant
+
+    C->>B: POST /documents (multipart PDF)
+    B->>B: validate extension, content type, %PDF magic, size
+    B->>F: write {document_id}.pdf
+    B->>P: INSERT Document(status="processing")
+    B->>R: enqueue documents.process(document_id)
+    B->>P: UPDATE celery_task_id
+    B-->>C: 202 {document_id, status, task_id}
+
+    R->>W: deliver task
+    W->>P: check status is still "processing"
+    W->>F: read PDF
+    W->>W: parse, chunk, embed
+    W->>P: guard — document still exists?
+    W->>Q: delete old points, upsert deterministic point ids
+    W->>P: replace chunks, status="ready"
+    W->>F: delete source PDF
+
+    C->>B: GET /documents/{id}
+    B-->>C: {"status": "ready", "chunks_count": 48}
 ```
 
 ### Request flow for a grounded answer
@@ -72,15 +118,25 @@ backend/
   dependencies.py        DI providers backed by app.state
   errors.py              domain errors mapped to HTTP status codes
   prompts.py             system prompts
+  observability.py       Prometheus metrics + stage logging
   api/                   health.py, documents.py, conversations.py, rag.py
   services/
     chunking.py            PDF extraction + word-window chunking (pure)
     embeddings.py          e5 encoder + cross-encoder reranker (loaded once)
     vector_store.py        Qdrant access, payload shape, document filtering
     rag_service.py         retrieve -> rerank -> build grounded context
-    document_service.py    upload validation and ingestion pipeline
+    storage.py             local PDF storage, traversal-safe paths
+    document_service.py    validation, CRUD, enqueue, delete
+    document_processor.py  the heavy pipeline the worker runs
     conversation_service.py chat turn orchestration
     inference_client.py    pooled httpx client for the inference service
+    task_queue.py          TaskDispatcher protocol (no Celery import)
+    broker.py              RabbitMQ / Celery liveness probes
+  worker/
+    celery_app.py          Celery instance, queues, retry defaults, signals
+    tasks.py               documents.process task + async bridge
+    context.py             per-process resources, model reuse
+    dispatch.py            Celery implementation of TaskDispatcher
   scripts/
     reset_qdrant.py        manual maintenance for the vector collection
 inference/               MLX/Gemma service (unchanged)
@@ -125,8 +181,20 @@ docker compose up -d
 docker compose ps
 ```
 
-This starts PostgreSQL 16 (`:5432`), Redis (`:6379`) and Qdrant (`:6333`), all
-bound to `127.0.0.1` only.
+This starts PostgreSQL 16 (`:5432`), Redis (`:6379`), Qdrant (`:6333`) and
+RabbitMQ (`:5672`, management UI on `:15672`) — every port bound to `127.0.0.1`
+only, so nothing is reachable from outside this machine.
+
+RabbitMQ takes ~20 s to report healthy on a cold start. Check it with:
+
+```bash
+docker compose ps
+docker exec private-ai-rabbitmq rabbitmq-diagnostics -q ping
+```
+
+The management UI is at <http://127.0.0.1:15672> (default dev credentials
+`privateai` / `privateai_dev_password`, override with `RABBITMQ_USER` and
+`RABBITMQ_PASSWORD`).
 
 ## 2. Run migrations
 
@@ -195,9 +263,47 @@ curl http://127.0.0.1:8001/health
 uvicorn backend.app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-On startup the backend creates the Qdrant collection if it is missing and loads
-the embedding and reranker models once (set `PRELOAD_MODELS=false` to defer this
-until the first RAG request). Interactive docs: <http://127.0.0.1:8000/docs>.
+On startup the backend creates the Qdrant collection if it is missing, prepares
+`UPLOAD_DIR` and loads the embedding and reranker models once (set
+`PRELOAD_MODELS=false` to defer this until the first RAG request). Interactive
+docs: <http://127.0.0.1:8000/docs>.
+
+## 5. Start the Celery worker
+
+In a second terminal, from the repository root:
+
+```bash
+celery -A backend.worker.celery_app worker \
+  --loglevel=info \
+  --pool=solo \
+  --queues=documents
+```
+
+**Use `--pool=solo` on Apple Silicon.** Celery's default `prefork` pool forks
+the process, and forking after torch has initialised Metal/MPS is unsafe — the
+child inherits GPU state it does not own and either hangs or crashes. `solo`
+runs tasks in the main process, so the embedding and reranker models are loaded
+once and reused by every task, which is also what you want for throughput on a
+single machine.
+
+`--pool=threads --concurrency=2` also works and keeps one shared copy of the
+models; use it if you want a little concurrency. If you ever do run `prefork`,
+the models are re-loaded per child (the `worker_process_init` signal
+deliberately drops any inherited handles) and you should add
+`OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` to the environment.
+
+The worker loads the models lazily, on the first document it processes, so
+startup is instant and the first ingestion is the slow one.
+
+Verify the worker is connected:
+
+```bash
+curl -s http://127.0.0.1:8000/health/workers | jq
+```
+
+```json
+{"workers": ["celery@your-mac"], "available": true}
+```
 
 ---
 
@@ -210,10 +316,14 @@ curl -s http://127.0.0.1:8000/health | jq
 ```
 
 ```json
-{"api":"ok","postgres":"ok","redis":"ok","qdrant":"ok","inference":"ok"}
+{"api":"ok","postgres":"ok","redis":"ok","qdrant":"ok","inference":"ok","rabbitmq":"ok"}
 ```
 
-### Upload a PDF
+`GET /health` never blocks on the worker fleet. Use `GET /health/workers` for
+that — it waits out its timeout when nobody answers, which is why it is a
+separate route.
+
+### Upload a PDF (asynchronous)
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/documents \
@@ -222,19 +332,58 @@ curl -s -X POST http://127.0.0.1:8000/documents \
 
 ```json
 {
-  "id": "0f1a...",
+  "document_id": "0f1a…",
+  "status": "processing",
+  "task_id": "8f2b…"
+}
+```
+
+`202 Accepted` comes back as soon as the file is on disk and the job is queued.
+The request only does cheap validation — extension, content type, `%PDF` magic
+bytes and the size limit — so a file over `MAX_UPLOAD_SIZE_MB` is still rejected
+with `413` before anything is queued.
+
+### Poll until it is ready
+
+```bash
+curl -s http://127.0.0.1:8000/documents/<document_id> | jq
+```
+
+```json
+{
+  "id": "0f1a…",
   "filename": "report.pdf",
   "status": "ready",
   "total_pages": 12,
   "extracted_pages": 12,
   "chunks_count": 48,
-  "error_message": null
+  "error_message": null,
+  "celery_task_id": "8f2b…"
 }
 ```
 
-Ingestion parses the PDF, chunks it, embeds the chunks, writes chunk metadata to
-PostgreSQL and vectors plus payload to Qdrant. On failure the document is kept
-with `status: "failed"` and an `error_message` so you can see what happened.
+`status` moves `processing → ready` or `processing → failed`. A failed document
+keeps a short, safe `error_message` (never a traceback) so you can see what went
+wrong; the traceback is in the worker log.
+
+A small polling loop:
+
+```bash
+DOC=$(curl -s -X POST http://127.0.0.1:8000/documents \
+        -F "file=@/path/to/report.pdf" | jq -r .document_id)
+
+until [ "$(curl -s http://127.0.0.1:8000/documents/$DOC | jq -r .status)" != "processing" ]; do
+  sleep 2
+done
+
+curl -s http://127.0.0.1:8000/documents/$DOC | jq '{status, chunks_count, error_message}'
+```
+
+There is deliberately no separate `GET /documents/{id}/status`: the document
+resource already carries the status, the metadata, the task id and the error
+message, and it is a cheap single-row read (chunks are only loaded when you ask
+for `?include_chunks=true`). A second endpoint would return a subset of the same
+data.
 
 List, inspect and delete:
 
@@ -340,10 +489,50 @@ All settings come from environment variables (or `.env`); see `.env.example`.
 | `CHUNK_SIZE_WORDS` / `CHUNK_OVERLAP_WORDS` | `220` / `40` | chunking window |
 | `MAX_CONTEXT_CHARS` | `12000` | cap on the grounded context |
 | `PRELOAD_MODELS` | `true` | load models at startup, not on first use |
+| `UPLOAD_DIR` | `data/uploads` | where PDFs wait for a worker |
+| `DELETE_SOURCE_AFTER_PROCESSING` | `true` | drop the PDF once it is indexed |
+| `CELERY_BROKER_URL` | `amqp://…@127.0.0.1:5672//` | RabbitMQ connection |
+| `CELERY_RESULT_BACKEND` | `redis://127.0.0.1:6379/1` | Celery results (optional) |
+| `CELERY_TASK_QUEUE` | `documents` | queue the worker consumes |
+| `CELERY_MAX_RETRIES` | `5` | retries for transient failures |
+| `CELERY_RETRY_BACKOFF_SECONDS` | `5` | base backoff, doubled with jitter |
+| `CELERY_RETRY_BACKOFF_MAX_SECONDS` | `300` | backoff ceiling |
+| `CELERY_TASK_SOFT_TIME_LIMIT` / `CELERY_TASK_TIME_LIMIT` | `1500` / `1800` | per-task limits |
+| `WORKER_METRICS_PORT` | `0` | worker Prometheus port; `0` disables it |
+| `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | dev defaults | consumed by docker-compose |
 | `LOG_LEVEL` | `INFO` | logging level |
 
-`.env` is git-ignored. The API key, prompt bodies and document text are never
-written to the logs.
+`.env` is git-ignored, and so is `data/`. The API key, prompt bodies and
+document text are never written to the logs — processing logs carry the
+document id, the task id, the stage name, a duration and counts only.
+
+## Observability
+
+Structured logs per ingestion stage (`load`, `read_source`, `parse`, `chunk`,
+`embed`, `index`, `persist`, `cleanup_source`):
+
+```
+document_stage stage=embed document_id=0f1a… task_id=8f2b… duration_ms=4180.2 vectors=48
+```
+
+Prometheus metrics — `documents_processing_total`,
+`document_processing_failures_total{reason}`,
+`document_processing_duration_seconds{outcome}` and
+`document_processing_stage_seconds{stage}`:
+
+```bash
+curl -s http://127.0.0.1:8000/metrics | grep document_processing
+```
+
+**Known limitation.** The API process and the Celery worker are separate
+processes, so `GET /metrics` on the backend does not include worker counters —
+and it is the worker that does the processing. Set `WORKER_METRICS_PORT=9100`
+to have the worker serve its own `/metrics`, and scrape both targets. That is
+correct for a single-process pool (`--pool=solo` or `--pool=threads`), which is
+the recommended setup here. Aggregating a multi-child `prefork` pool into one
+endpoint needs `prometheus_client`'s multiprocess mode and a shared
+`PROMETHEUS_MULTIPROC_DIR`; rather than ship a version that silently reports
+only the parent's numbers, that is left as a TODO.
 
 ## Maintaining the vector collection
 
@@ -389,12 +578,18 @@ Errors are returned as `{"detail": "..."}` — never a Python traceback.
 
 | Status | Meaning |
 | --- | --- |
-| `400` | not a PDF, corrupt PDF, or no extractable text |
+| `202` | upload accepted and queued (not an error, but not `201` either) |
+| `400` | wrong extension or content type, missing `%PDF` magic, empty file |
 | `404` | unknown conversation or document |
 | `413` | upload above `MAX_UPLOAD_SIZE_MB` |
-| `422` | request body failed validation |
+| `422` | request body or path parameter failed validation |
 | `502` | inference service unreachable or returned an error |
 | `503` | Qdrant unavailable during a delete |
+
+Since ingestion moved to a worker, a PDF that is well-formed enough to pass the
+magic-byte check but cannot actually be parsed is no longer a `400` on
+`POST /documents`. It is accepted, and the failure shows up as
+`status: "failed"` with an `error_message` on the document.
 
 ## Development
 
@@ -402,11 +597,14 @@ Errors are returned as `{"detail": "..."}` — never a Python traceback.
 python -m compileall backend     # syntax check
 ruff check backend tests         # lint
 pytest -q                        # offline unit tests
-pytest -m integration            # needs live Postgres + Qdrant
+pytest -m integration            # needs live Postgres, Qdrant and RabbitMQ
+alembic check                    # models and migrations agree
 ```
 
-Unit tests never touch the network: the models, Qdrant, Redis and the inference
-service are replaced by in-process fakes, and PostgreSQL by in-memory SQLite.
+Unit tests never touch the network: the models, Qdrant, Redis, RabbitMQ and the
+inference service are replaced by in-process fakes, and PostgreSQL by in-memory
+SQLite. The Celery task body is tested by calling it directly with those fakes,
+and its retry policy in Celery's eager mode — no broker is needed.
 
 New migration after changing `backend/models.py`:
 
@@ -421,11 +619,21 @@ alembic upgrade head
 - **No authentication.** The `users` table exists and `Conversation.user_id` is
   nullable, but there is no login flow yet and the API is unauthenticated —
   keep it bound to `127.0.0.1`.
-- **Ingestion is synchronous.** A large PDF blocks its request for the whole
-  parse/embed cycle; there is no background worker or progress polling yet, so
-  `status: "processing"` is only ever observed on a failed request.
+- **No progress detail.** A document is `processing` or it is not; there is no
+  percentage, no stage readout and no push notification — poll the document.
+- **Deep PDF validation is deferred.** `POST /documents` cannot tell you a PDF
+  is unparseable, because it does not parse it. You learn that from the
+  document's `status` afterwards.
+- **Worker metrics are a separate scrape target.** See
+  [Observability](#observability); a merged multiprocess registry is a TODO.
+- **Revoking is best effort.** `DELETE` on a processing document revokes the
+  task, but a worker that already started keeps running until its next guard
+  check. Correctness does not depend on the revoke — the guards do.
 - **Scanned PDFs produce nothing.** There is no OCR, so image-only pages are
-  skipped and a fully scanned document fails with `400`.
+  skipped and a fully scanned document ends up `failed`.
+- **The deprecated `POST /documents/upload` still blocks.** It is kept for
+  backward compatibility and runs the pipeline inline; it does not use the
+  worker at all.
 - **Single inference process.** The inference service serialises generation
   behind a lock, so concurrent chat requests queue up.
 - **No streaming through the backend.** The inference service exposes

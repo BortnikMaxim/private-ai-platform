@@ -158,6 +158,14 @@ class Document(Base):
 
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Id of the Celery task ingesting this document; used to revoke the task
+    # when the document is deleted while still processing.
+    celery_task_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utcnow,

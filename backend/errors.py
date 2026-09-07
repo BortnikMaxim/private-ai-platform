@@ -47,3 +47,28 @@ class InferenceUnavailableError(AppError):
 class VectorStoreError(AppError):
     status_code = 503
     default_detail = "Vector store is unavailable"
+
+
+class DocumentSourceMissingError(AppError):
+    """The uploaded file backing a document is gone. Permanent, do not retry."""
+
+    status_code = 410
+    default_detail = "Uploaded file is no longer available"
+
+
+class TransientProcessingError(AppError):
+    """A failure worth retrying: Qdrant down, database connection dropped, ...
+
+    Celery retries tasks that raise this with exponential backoff and jitter;
+    every other exception is treated as permanent.
+    """
+
+    status_code = 503
+    default_detail = "Temporary processing failure"
+
+
+class DocumentGoneError(AppError):
+    """The document disappeared mid-processing (deleted by a concurrent request)."""
+
+    status_code = 404
+    default_detail = "Document was deleted while it was being processed"

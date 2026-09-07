@@ -46,6 +46,28 @@ services:
     # is no in-container way to probe the HTTP API. The backend reports Qdrant
     # status through GET /health instead.
 
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: private-ai-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-privateai}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-privateai_dev_password}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+    ports:
+      # AMQP and the management UI are both bound to the loopback interface
+      # only; the broker is never reachable from outside this machine.
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
 # The MLX/Gemma inference service is intentionally NOT containerised: it needs
 # native Apple Silicon Metal access and runs on the host at 127.0.0.1:8001.
 
@@ -53,3 +75,4 @@ volumes:
   postgres_data:
   redis_data:
   qdrant_data:
+  rabbitmq_data:

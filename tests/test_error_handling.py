@@ -148,23 +148,39 @@ async def test_non_pdf_upload_is_400(client):
     assert_clean_error(response, 400)
 
 
-async def test_corrupt_pdf_upload_is_400(client):
+async def test_upload_without_pdf_magic_is_400(client):
     response = await client.post(
         "/documents",
-        files={"file": ("broken.pdf", b"%PDF-1.4\nnot really", "application/pdf")},
+        files={"file": ("fake.pdf", b"not a pdf at all", "application/pdf")},
     )
 
     assert_clean_error(response, 400)
 
 
-async def test_pdf_without_text_is_400(client):
+async def test_structurally_valid_but_unparseable_pdf_is_accepted_then_failed(client):
+    """Deep validation moved to the worker; the request only does cheap checks.
+
+    A file that starts with %PDF cannot be rejected without parsing it, so it
+    is accepted and the failure surfaces as ``status: failed`` on the document.
+    """
+    response = await client.post(
+        "/documents",
+        files={"file": ("broken.pdf", b"%PDF-1.4\nnot really", "application/pdf")},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "processing"
+
+
+async def test_deprecated_sync_upload_still_reports_a_bad_pdf_as_400(client):
+    """The compatibility endpoint parses inline, so it can still answer 400."""
     writer = PdfWriter()
     writer.add_blank_page(width=200, height=200)
     buffer = io.BytesIO()
     writer.write(buffer)
 
     response = await client.post(
-        "/documents",
+        "/documents/upload",
         files={"file": ("blank.pdf", buffer.getvalue(), "application/pdf")},
     )
 
