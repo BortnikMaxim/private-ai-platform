@@ -34,6 +34,7 @@ from backend.prompts.agent import FALLBACK_ANSWER
 from backend.services.document_service import DocumentService
 from backend.services.inference_client import InferenceClient
 from backend.services.rag_service import RagService
+from backend.tracing import NULL_TRACER, Tracer, current_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +91,14 @@ class AgentService:
         documents: DocumentService,
         registry: ToolRegistry,
         settings: Settings,
+        tracer: Tracer | None = None,
     ) -> None:
         self.inference = inference
         self.rag = rag
         self.documents = documents
         self.registry = registry
         self.settings = settings
+        self.tracer = tracer or NULL_TRACER
 
         self.nodes = AgentNodes(
             inference=inference,
@@ -103,6 +106,7 @@ class AgentService:
             registry=registry,
             structured=StructuredCaller(inference, settings),
             settings=settings,
+            tracer=self.tracer,
         )
         # Compiled once; per-request data travels in the state and the config.
         self.graph = build_graph(self.nodes)
@@ -143,24 +147,31 @@ class AgentService:
             }
         }
 
-        try:
-            final: AgentState = await self.graph.ainvoke(state, config=config)
+        # Root span for the turn. The user message is content and is attached
+        # only when capture is switched on.
+        with self.tracer.span(
+            "agent.request",
+            as_type="agent",
+            request_id=current_request_id(),
+            use_rag=use_rag,
+            scoped=bool(document_ids),
+            history=len(state["chat_history"]),
+        ) as turn_span:
+            turn_span.set_content(input=user_message)
 
-        except InferenceUnavailableError:
-            # Propagates to the router as a 502; the endpoint has already
-            # persisted the user turn.
-            AGENT_REQUESTS_TOTAL.labels(route="unknown", status="inference_error").inc()
-            AGENT_DURATION_SECONDS.observe(time.perf_counter() - started)
-            agent_event("agent_failed", key, reason="inference_unavailable")
-            raise
-
-        except Exception:
-            AGENT_REQUESTS_TOTAL.labels(route="unknown", status="error").inc()
-            AGENT_DURATION_SECONDS.observe(time.perf_counter() - started)
-            # Traceback to the log, never to the client.
-            logger.exception("agent_crashed conversation_id=%s", key)
-            agent_event("agent_failed", key, reason="internal_error")
-            raise
+            try:
+                final = await self._invoke(state, config)
+            except Exception:
+                raise
+            else:
+                turn_span.update(
+                    route=final.get("route"),
+                    steps=final.get("step_count"),
+                    tools=len(final.get("tool_results", [])),
+                    sources=len(final.get("retrieved_sources", [])),
+                    errors=len(final.get("errors", [])),
+                )
+                turn_span.set_content(output=final.get("final_answer"))
 
         duration = time.perf_counter() - started
         AGENT_DURATION_SECONDS.observe(duration)
@@ -189,3 +200,26 @@ class AgentService:
         )
 
         return final
+
+    async def _invoke(self, state: AgentState, config: dict[str, Any]) -> AgentState:
+        started = time.perf_counter()
+        key = state.get("conversation_id", "")
+
+        try:
+            return await self.graph.ainvoke(state, config=config)
+
+        except InferenceUnavailableError:
+            # Propagates to the router as a 502; the endpoint has already
+            # persisted the user turn.
+            AGENT_REQUESTS_TOTAL.labels(route="unknown", status="inference_error").inc()
+            AGENT_DURATION_SECONDS.observe(time.perf_counter() - started)
+            agent_event("agent_failed", key, reason="inference_unavailable")
+            raise
+
+        except Exception:
+            AGENT_REQUESTS_TOTAL.labels(route="unknown", status="error").inc()
+            AGENT_DURATION_SECONDS.observe(time.perf_counter() - started)
+            # Traceback to the log, never to the client.
+            logger.exception("agent_crashed conversation_id=%s", key)
+            agent_event("agent_failed", key, reason="internal_error")
+            raise

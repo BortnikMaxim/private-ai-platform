@@ -53,6 +53,25 @@ class Settings(BaseSettings):
     # right default for an API-only service.
     cors_allowed_origins: str = ""
 
+    # --- tracing (Langfuse) ------------------------------------------------
+    # Entirely optional. With this off the application behaves exactly as it
+    # did before tracing existed, and no Langfuse code runs.
+    langfuse_enabled: bool = False
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+    # Seconds the SDK may spend on a network call before giving up. Kept short
+    # because tracing must never hold a user request open.
+    langfuse_timeout_seconds: int = Field(default=5, ge=1, le=60)
+    # OFF by default and deliberately so: prompts, questions and retrieved
+    # chunks are user content. Turning this on ships that content to whatever
+    # Langfuse instance is configured. See the privacy notes in the README.
+    langfuse_capture_content: bool = False
+    # Truncation applied to any captured content, as a second line of defence
+    # against shipping a whole document by accident.
+    langfuse_max_content_chars: int = Field(default=1000, ge=0, le=20_000)
+    langfuse_environment: str = "development"
+
     # --- rate limiting ----------------------------------------------------
     rate_limit_enabled: bool = True
     rate_limit_auth_per_minute: int = Field(default=10, ge=1, le=10_000)

@@ -2,7 +2,13 @@
 
 from fastapi import APIRouter, HTTPException
 
-from backend.dependencies import CurrentUser, DbSession, InferenceDep, RagDep
+from backend.dependencies import (
+    CurrentUser,
+    DbSession,
+    InferenceDep,
+    RagDep,
+    TracerDep,
+)
 from backend.prompts import GROUNDED_SYSTEM_PROMPT
 from backend.schemas import (
     AskRequest,
@@ -14,6 +20,7 @@ from backend.schemas import (
 )
 from backend.services.fusion import reciprocal_rank_fusion
 from backend.services.rag_service import MODE_HYBRID
+from backend.tracing import current_request_id
 
 router = APIRouter(prefix="/rag", tags=["rag"])
 
@@ -25,43 +32,59 @@ async def ask(
     inference: InferenceDep,
     user: CurrentUser,
     session: DbSession,
+    tracer: TracerDep,
 ) -> AskResponse:
     # document_ids narrows the search; the tenant filter still applies on top,
     # so a foreign id in the body simply matches nothing.
     document_ids = [str(value) for value in payload.document_ids or []] or None
 
-    retrieved = await rag.retrieve(
-        question=payload.question,
+    with tracer.trace(
+        "rag.request",
+        request_id=current_request_id(),
         user_id=str(user.id),
         top_k=payload.top_k,
-        candidate_k=payload.candidate_k,
-        document_ids=document_ids,
-        session=session,
-    )
+        scoped=bool(document_ids),
+    ) as trace:
+        trace.set_content(input=payload.question)
 
-    if not retrieved:
-        raise HTTPException(
-            status_code=404,
-            detail="No relevant documents found",
+        retrieved = await rag.retrieve(
+            question=payload.question,
+            user_id=str(user.id),
+            top_k=payload.top_k,
+            candidate_k=payload.candidate_k,
+            document_ids=document_ids,
+            session=session,
         )
 
-    context = rag.build_context(retrieved)
+        trace.update(sources=len(retrieved))
 
-    answer = await inference.chat(
-        [
-            {"role": "system", "content": GROUNDED_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"КОНТЕКСТ:\n\n{context}\n\nВОПРОС:\n{payload.question}",
-            },
-        ],
-        temperature=0.1,
-    )
+        if not retrieved:
+            raise HTTPException(
+                status_code=404,
+                detail="No relevant documents found",
+            )
 
-    return AskResponse(
-        answer=answer,
-        sources=[to_source(chunk) for chunk in retrieved],
-    )
+        context = rag.build_context(retrieved)
+
+        answer = await inference.chat(
+            [
+                {"role": "system", "content": GROUNDED_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"КОНТЕКСТ:\n\n{context}\n\nВОПРОС:\n{payload.question}"
+                    ),
+                },
+            ],
+            temperature=0.1,
+        )
+
+        trace.set_content(output=answer)
+
+        return AskResponse(
+            answer=answer,
+            sources=[to_source(chunk) for chunk in retrieved],
+        )
 
 
 @router.post("/retrieve", response_model=RetrieveResponse)

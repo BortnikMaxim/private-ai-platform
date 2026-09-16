@@ -1038,6 +1038,8 @@ All settings come from environment variables (or `.env`); see `.env.example`.
 | `RATE_LIMIT_CHAT_PER_MINUTE` | `30` | messages and agent turns, per user |
 | `RATE_LIMIT_UPLOAD_PER_MINUTE` | `10` | document uploads, per user |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | window length |
+| `LANGFUSE_ENABLED` | `false` | LLM/RAG/agent tracing; see [Observability](#observability) |
+| `LANGFUSE_CAPTURE_CONTENT` | `false` | opt-in prompt/answer capture |
 | `LOG_LEVEL` | `INFO` | logging level |
 
 `.env` is git-ignored, and so is `data/`. The API key, prompt bodies and
@@ -1046,43 +1048,135 @@ document id, the task id, the stage name, a duration and counts only.
 
 ## Observability
 
-Structured logs per ingestion stage (`load`, `read_source`, `parse`, `chunk`,
-`embed`, `index`, `persist`, `cleanup_source`):
+Three layers with different jobs. None of them replaces another.
 
-```
-document_stage stage=embed document_id=0f1a… task_id=8f2b… duration_ms=4180.2 vectors=48
-```
+| Layer | Answers | Scope |
+| --- | --- | --- |
+| Prometheus | "is the service healthy?" | aggregates over time, alerting, SLOs |
+| Structured logs | "what happened to request X?" | per-request facts, errors, correlation |
+| Langfuse | "where did this answer come from?" | per-request stage timings, routing, retrieval counts, token usage |
 
-Agent runs log the same way — identifiers, route, tool name, step and duration,
-never the user's message or the prompts:
+A single `request_id` ties them together. `RequestContextMiddleware` assigns one
+(or reuses a sanitised inbound `X-Request-ID`), publishes it in a contextvar,
+puts it in every log line and returns it in the response header. The Langfuse
+trace id is derived from the same value, so a log line leads straight to its
+trace.
 
-```
-agent_started   conversation_id=30d9c013… history=1 scoped=False use_rag=False
-agent_routed    conversation_id=30d9c013… duration_ms=2734.4 route=tool step=1 tool_name=calculator
-agent_tool_completed conversation_id=30d9c013… duration_ms=2085.1 step=2 success=True tool_name=calculator
-agent_completed conversation_id=30d9c013… duration_ms=5697.3 errors=0 route=tool sources=0 step=3 tools=1
-```
+### Prometheus
 
-Prometheus metrics — `documents_processing_total`,
+`GET /metrics`, unauthenticated so a scraper needs no token.
+
+Document ingestion: `documents_processing_total`,
 `document_processing_failures_total{reason}`,
 `document_processing_duration_seconds{outcome}`,
-`document_processing_stage_seconds{stage}`, plus
-`agent_requests_total{route,status}`, `agent_duration_seconds` and
-`agent_tool_calls_total{tool,status}`:
+`document_processing_stage_seconds{stage}`.
 
-```bash
-curl -s http://127.0.0.1:8000/metrics | grep document_processing
+Agent: `agent_requests_total{route,status}`, `agent_duration_seconds`,
+`agent_tool_calls_total{tool,status}`, `agent_tool_duration_seconds{tool}`.
+
+LLM: `llm_requests_total{model,status}`, `llm_request_duration_seconds{model}`,
+`llm_tokens_total{model,kind}`.
+
+Auth: `auth_logins_total{status}`, `auth_registrations_total{status}`,
+`rate_limit_rejections_total{route}`.
+
+**Why no identifiers in labels.** Prometheus stores one time series per label
+combination. A `user_id`, `document_id`, `conversation_id` or `request_id` label
+is unbounded, so the series count grows with traffic until the scrape target
+runs out of memory — the classic cardinality explosion. Those identifiers belong
+in logs and traces, which are built to hold them. Every label above comes from a
+closed set: one or two model ids, a handful of statuses, four registered tools.
+
+### Structured logs
+
+Stage-level lines with identifiers, counts and durations:
+
+```
+request_completed request_id=8f2b… method=POST path=/rag/ask status=200 duration_ms=412.3
+rag_retrieved mode=hybrid dense=15 lexical=12 fused=21 scoped=False
+agent_routed conversation_id=30d9… duration_ms=2734.4 route=tool step=1 tool_name=calculator
+document_stage stage=embed document_id=0f1a… duration_ms=4180.2 vectors=48
 ```
 
-**Known limitation.** The API process and the Celery worker are separate
-processes, so `GET /metrics` on the backend does not include worker counters —
-and it is the worker that does the processing. Set `WORKER_METRICS_PORT=9100`
-to have the worker serve its own `/metrics`, and scrape both targets. That is
-correct for a single-process pool (`--pool=solo` or `--pool=threads`), which is
-the recommended setup here. Aggregating a multi-child `prefork` pool into one
-endpoint needs `prometheus_client`'s multiprocess mode and a shared
-`PROMETHEUS_MULTIPROC_DIR`; rather than ship a version that silently reports
-only the parent's numbers, that is left as a TODO.
+Never logged: passwords, password hashes, JWTs, the `Authorization` header, API
+keys, prompts, document text or full email addresses.
+
+### Langfuse
+
+Optional and off by default. With `LANGFUSE_ENABLED=false` no Langfuse code runs
+and the instrumented call sites take a no-op path.
+
+Spans, emitted only for stages that actually ran:
+
+```
+rag.request | agent.request
+├── agent.route          (structured routing decision: parsed, repaired)
+├── retrieval            (mode, top_k, scoped, results)
+│   ├── retrieval.dense    (limit, candidates)
+│   ├── retrieval.lexical  (limit, candidates)      — hybrid mode only
+│   ├── retrieval.fusion   (rrf_k, overlap, fused)  — hybrid mode only
+│   └── retrieval.rerank   (candidates, model)      — when reranking is on
+├── agent.tool           (tool, status, duration)   — when a tool ran
+└── llm.generate         (model, usage, finish_reason)
+```
+
+A dense-mode request has no `retrieval.lexical` or `retrieval.fusion` span, and
+a direct answer has no retrieval spans at all. Spans describe what happened, not
+a fixed template.
+
+**Fail open.** Tracing is diagnostic and is never allowed to affect a request.
+Every Langfuse interaction is wrapped: an unreachable host, invalid credentials,
+a missing package or an export failure is logged once and then swallowed, the
+tracer marks itself degraded, and requests continue untraced. The "once" matters
+— a broken exporter must not turn into a log flood.
+
+**Configuration**
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `LANGFUSE_ENABLED` | `false` | master switch |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | *(empty)* | credentials; incomplete pair leaves tracing off |
+| `LANGFUSE_HOST` | `https://cloud.langfuse.com` | self-hosted instances work too |
+| `LANGFUSE_TIMEOUT_SECONDS` | `5` | short, so tracing cannot hold a request open |
+| `LANGFUSE_CAPTURE_CONTENT` | `false` | see below |
+| `LANGFUSE_MAX_CONTENT_CHARS` | `1000` | truncation when capture is on |
+| `LANGFUSE_ENVIRONMENT` | `development` | separates traces per environment |
+
+### Privacy defaults
+
+Spans carry **metadata only** by default: request id, route, mode, model name,
+candidate counts, `top_k`, durations, tool names, statuses and token counts.
+
+Never sent, in any configuration: JWTs, the `Authorization` header, API keys,
+passwords or hashes, environment variables, raw uploaded documents. Exception
+*messages* are not recorded either — only the exception class, because a message
+can carry a path, a query or a row of data.
+
+`LANGFUSE_CAPTURE_CONTENT=true` additionally sends prompts, questions, retrieved
+chunk text, tool arguments and answers. That is user content, so it is opt-in,
+off by default, truncated when on, and worth enabling only against data you are
+willing to place in the configured Langfuse instance.
+
+### Token accounting
+
+`llm.generate` records token counts **only when the inference service reports
+them**. It does, because mlx-vlm's `GenerationResult` exposes `prompt_tokens`,
+`generation_tokens` and `total_tokens` from the tokenizer that just processed
+the request. The service passes them through as a `usage` object tagged
+`source: "local_tokenizer"`.
+
+That tag is deliberate. These are **locally measured counts from the serving
+process**, not a third-party provider's billing-grade usage. A consumer must be
+able to tell the two apart.
+
+If a response carries no `usage`, or a partial one, the backend records no usage
+at all — `_usage_from()` returns `None` rather than guessing. An estimate
+presented as provider usage would make the token metrics quietly wrong, which is
+worse than not having them.
+
+**Cost is not calculated.** The model runs locally on the developer's machine;
+there is no per-token price to multiply by. A fabricated cost figure would be
+worse than none, so no cost is reported anywhere.
 
 ## Maintaining the vector collection
 
@@ -1152,8 +1246,8 @@ alembic check                    # models and migrations agree
 python -m backend.scripts.eval_retrieval   # retrieval metrics (needs Qdrant + Postgres)
 ```
 
-Unit tests never touch the network: the models, Qdrant, Redis, RabbitMQ and the
-inference service are replaced by in-process fakes, and PostgreSQL by in-memory
+Unit tests never touch the network: the models, Qdrant, Redis, RabbitMQ, the
+inference service and Langfuse are replaced by in-process fakes, and PostgreSQL by in-memory
 SQLite. The Celery task body is tested by calling it directly with those fakes,
 and its retry policy in Celery's eager mode — no broker is needed. Agent tests
 script the fake inference client's replies, so routing, tool calling and every
@@ -1246,6 +1340,16 @@ alembic upgrade head
   as a benchmark.
 - **No answer-quality evaluation.** The dataset has no reference answers, so
   faithfulness, relevance and correctness of generated text are unmeasured.
-- **No agent tracing UI.** LangSmith is installed transitively but not
+- **Traces are best-effort.** Tracing fails open by design, so a degraded
+  exporter silently drops spans. The absence of a trace is not evidence that a
+  request did not happen — the logs and metrics are the authoritative record.
+- **No cost monitoring.** The model is local, so there is no per-token price to
+  attach; no cost figure is reported anywhere.
+- **Token usage covers the local service only.** Counts come from mlx-vlm's own
+  generation loop. A different provider would need its own usage mapping, and
+  one that reports nothing would leave the field empty rather than estimated.
+- **The Celery worker is not traced.** Spans are emitted from the API process;
+  document ingestion is observable through Prometheus and structured logs only.
+- **No agent tracing UI beyond Langfuse.** LangSmith is installed transitively but not
   configured, and no checkpointer is attached — the graph is stateless between
   turns and memory comes from the `messages` table.

@@ -24,6 +24,7 @@ from backend.services.embeddings import EmbeddingService
 from backend.services.fusion import reciprocal_rank_fusion
 from backend.services.lexical_index import LexicalRetriever
 from backend.services.vector_store import VectorStore
+from backend.tracing import NULL_TRACER, Tracer
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +40,13 @@ class RagService:
         vector_store: VectorStore,
         settings: Settings,
         lexical: LexicalRetriever | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         self.embeddings = embeddings
         self.vector_store = vector_store
         self.settings = settings
         self.lexical = lexical
+        self.tracer = tracer or NULL_TRACER
 
     # -- branches ---------------------------------------------------------
 
@@ -141,53 +144,93 @@ class RagService:
         """Full retrieval pipeline used by /rag/ask, conversations and the agent."""
         effective = self.resolve_mode(mode, session)
         dense_limit = candidate_k or self.settings.rag_candidate_k
+        final_k = top_k or self.settings.rag_top_k
 
-        dense = await self.vector_retrieve(
-            question=question,
-            user_id=user_id,
-            limit=dense_limit,
-            document_ids=document_ids,
-        )
+        # One span per real stage. The question itself is content and is only
+        # attached when content capture is explicitly enabled.
+        with self.tracer.span(
+            "retrieval",
+            as_type="retriever",
+            mode=effective,
+            scoped=bool(document_ids),
+            top_k=final_k,
+        ) as retrieval_span:
+            retrieval_span.set_content(input=question)
 
-        if effective == MODE_HYBRID:
-            lexical = await self.lexical_retrieve(
-                session=session,
-                question=question,
-                user_id=user_id,
-                limit=lexical_k or self.settings.rag_lexical_candidate_k,
-                document_ids=document_ids,
-            )
-            pool = reciprocal_rank_fusion(
-                [dense, lexical],
-                rrf_k=rrf_k or self.settings.rag_rrf_k,
-            )
-            logger.info(
-                "rag_retrieved mode=hybrid dense=%d lexical=%d fused=%d scoped=%s",
-                len(dense),
-                len(lexical),
-                len(pool),
-                bool(document_ids),
-            )
-        else:
-            pool = dense
-            logger.info(
-                "rag_retrieved mode=dense candidates=%d scoped=%s",
-                len(pool),
-                bool(document_ids),
-            )
+            with self.tracer.span("retrieval.dense", limit=dense_limit) as span:
+                dense = await self.vector_retrieve(
+                    question=question,
+                    user_id=user_id,
+                    limit=dense_limit,
+                    document_ids=document_ids,
+                )
+                span.update(candidates=len(dense))
 
-        # The reranker is the expensive stage, so it only ever sees a bounded
-        # slice of the fused pool.
-        pool = pool[: self.settings.rag_rerank_candidate_k]
+            if effective == MODE_HYBRID:
+                lexical_limit = lexical_k or self.settings.rag_lexical_candidate_k
 
-        if not rerank:
-            return pool[: top_k or self.settings.rag_top_k]
+                with self.tracer.span("retrieval.lexical", limit=lexical_limit) as span:
+                    lexical = await self.lexical_retrieve(
+                        session=session,
+                        question=question,
+                        user_id=user_id,
+                        limit=lexical_limit,
+                        document_ids=document_ids,
+                    )
+                    span.update(candidates=len(lexical))
 
-        return await self.rerank(
-            question=question,
-            candidates=pool,
-            top_k=top_k or self.settings.rag_top_k,
-        )
+                effective_rrf_k = rrf_k or self.settings.rag_rrf_k
+
+                with self.tracer.span("retrieval.fusion", rrf_k=effective_rrf_k) as span:
+                    pool = reciprocal_rank_fusion(
+                        [dense, lexical],
+                        rrf_k=effective_rrf_k,
+                    )
+                    span.update(
+                        dense_candidates=len(dense),
+                        lexical_candidates=len(lexical),
+                        fused_candidates=len(pool),
+                        overlap=len(dense) + len(lexical) - len(pool),
+                    )
+
+                logger.info(
+                    "rag_retrieved mode=hybrid dense=%d lexical=%d fused=%d scoped=%s",
+                    len(dense),
+                    len(lexical),
+                    len(pool),
+                    bool(document_ids),
+                )
+            else:
+                pool = dense
+                logger.info(
+                    "rag_retrieved mode=dense candidates=%d scoped=%s",
+                    len(pool),
+                    bool(document_ids),
+                )
+
+            # The reranker is the expensive stage, so it only ever sees a
+            # bounded slice of the fused pool.
+            pool = pool[: self.settings.rag_rerank_candidate_k]
+
+            if not rerank:
+                results = pool[:final_k]
+                retrieval_span.update(reranked=False, results=len(results))
+                return results
+
+            with self.tracer.span("retrieval.rerank", candidates=len(pool)) as span:
+                results = await self.rerank(
+                    question=question,
+                    candidates=pool,
+                    top_k=final_k,
+                )
+                span.update(
+                    results=len(results),
+                    model=self.settings.reranker_model,
+                )
+
+            retrieval_span.update(reranked=True, results=len(results))
+
+            return results
 
     def build_context(self, chunks: list[dict[str, Any]]) -> str:
         """Render retrieved chunks as a numbered, size-bounded context block."""

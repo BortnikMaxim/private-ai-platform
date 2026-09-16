@@ -15,8 +15,8 @@ from inference.schemas import (
     ChatResponse,
     GenerateRequest,
     GenerateResponse,
+    Usage,
 )
-
 
 setup_logging()
 logger = logging.getLogger("inference_api")
@@ -126,7 +126,7 @@ def generate_text(
     start = time.perf_counter()
 
     try:
-        text, elapsed = gemma_service.generate(
+        text, elapsed, meta = gemma_service.generate(
             prompt=request.prompt,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
@@ -145,6 +145,8 @@ def generate_text(
             model=MODEL_ID,
             text=text,
             generation_time_seconds=round(elapsed, 3),
+            usage=Usage(**meta["usage"]) if meta.get("usage") else None,
+            finish_reason=meta.get("finish_reason"),
         )
 
     except Exception as exc:
@@ -177,7 +179,7 @@ def chat(
     start = time.perf_counter()
 
     try:
-        text, elapsed = gemma_service.chat(
+        text, elapsed, meta = gemma_service.chat(
             messages=messages,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
@@ -199,6 +201,8 @@ def chat(
                 content=text,
             ),
             generation_time_seconds=round(elapsed, 3),
+            usage=Usage(**meta["usage"]) if meta.get("usage") else None,
+            finish_reason=meta.get("finish_reason"),
         )
 
     except Exception as exc:
@@ -232,12 +236,11 @@ def chat_stream(
         start = time.perf_counter()
 
         try:
-            for chunk in gemma_service.stream_chat(
+            yield from gemma_service.stream_chat(
                 messages=messages,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
-            ):
-                yield chunk
+            )
 
             elapsed = time.perf_counter() - start
             GENERATION_LATENCY.observe(elapsed)

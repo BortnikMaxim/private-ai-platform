@@ -33,6 +33,7 @@ from backend.prompts.agent import (
 )
 from backend.services.inference_client import InferenceClient
 from backend.services.rag_service import RagService
+from backend.tracing import NULL_TRACER, Tracer
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +62,14 @@ class AgentNodes:
         registry: ToolRegistry,
         structured: StructuredCaller,
         settings: Settings,
+        tracer: Tracer | None = None,
     ) -> None:
         self.inference = inference
         self.rag = rag
         self.registry = registry
         self.structured = structured
         self.settings = settings
+        self.tracer = tracer or NULL_TRACER
 
     # -- helpers ----------------------------------------------------------
 
@@ -140,11 +143,17 @@ class AgentNodes:
         # branch can produce a real answer without the model, and an empty
         # retrieval would otherwise be reported as "nothing in the documents",
         # which is a lie about why the request failed. It propagates to a 502.
-        result = await self.structured.call(
-            RouteDecision,
-            system_prompt=ROUTER_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-        )
+        with self.tracer.span("agent.route", step=step) as route_span:
+            result = await self.structured.call(
+                RouteDecision,
+                system_prompt=ROUTER_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+            )
+            route_span.update(
+                parsed=result.ok,
+                repaired=result.repaired,
+                default_route=default_route,
+            )
 
         if not result.ok:
             errors.append(f"routing failed: {result.error}")

@@ -3,6 +3,25 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class Usage(BaseModel):
+    """Token counts measured by this service's own generation loop.
+
+    These come from mlx-vlm's ``GenerationResult``: the tokenizer that actually
+    processed the request reports them. They are neither an estimate nor a
+    third-party provider's billing figure, which is why ``source`` says so
+    explicitly — a consumer must be able to tell measured usage apart from a
+    guess.
+
+    ``None`` on a response means the runtime did not report counts. It never
+    means zero.
+    """
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    source: str = "local_tokenizer"
+
+
 class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20_000)
     max_tokens: int = Field(default=300, ge=1, le=2000)
@@ -13,6 +32,8 @@ class GenerateResponse(BaseModel):
     model: str
     text: str
     generation_time_seconds: float
+    usage: Usage | None = None
+    finish_reason: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -30,3 +51,5 @@ class ChatResponse(BaseModel):
     model: str
     message: ChatMessage
     generation_time_seconds: float
+    usage: Usage | None = None
+    finish_reason: str | None = None

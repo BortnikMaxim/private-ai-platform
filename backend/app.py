@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from qdrant_client import AsyncQdrantClient
 from sqlalchemy.ext.asyncio import async_sessionmaker
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.agent.graph import AgentService
 from backend.agent.tools.registry import default_registry
@@ -17,6 +16,7 @@ from backend.config import Settings
 from backend.config import settings as default_settings
 from backend.db import create_engine
 from backend.errors import AppError, RateLimitExceededError
+from backend.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
 from backend.services.auth_service import AuthService
 from backend.services.broker import BrokerClient
 from backend.services.conversation_service import ConversationService
@@ -29,6 +29,7 @@ from backend.services.rag_service import RagService
 from backend.services.rate_limiter import RateLimiter
 from backend.services.storage import DocumentStorage
 from backend.services.vector_store import VectorStore
+from backend.tracing import Tracer
 
 logger = logging.getLogger("backend")
 
@@ -56,6 +57,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Every resource is registered with the exit stack as soon as it exists, so
     # a failure while building a later one still tears down the earlier ones.
     async with AsyncExitStack() as stack:
+        # Built first: every service below may receive it, and its shutdown
+        # flushes whatever spans are still buffered.
+        tracer = Tracer(settings)
+        stack.callback(tracer.shutdown)
+
         db_engine = create_engine(settings.database_url)
         stack.push_async_callback(db_engine.dispose)
 
@@ -77,6 +83,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             health_timeout=settings.inference_health_timeout_seconds,
             default_max_tokens=settings.inference_max_tokens,
             default_temperature=settings.inference_temperature,
+            tracer=tracer,
         )
         stack.push_async_callback(inference_client.aclose)
 
@@ -96,6 +103,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             vector_store=vector_store,
             settings=settings,
             lexical=lexical_index,
+            tracer=tracer,
         )
 
         storage = DocumentStorage(settings.upload_dir)
@@ -128,7 +136,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         task_dispatcher = CeleryTaskDispatcher()
 
-        tool_registry = default_registry()
+        tool_registry = default_registry(tracer=tracer)
 
         agent_service = AgentService(
             inference=inference_client,
@@ -136,6 +144,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             documents=document_service,
             registry=tool_registry,
             settings=settings,
+            tracer=tracer,
         )
 
         conversation_service = ConversationService(
@@ -159,6 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.embeddings = embeddings
         app.state.rag_service = rag_service
         app.state.lexical_index = lexical_index
+        app.state.tracer = tracer
         app.state.storage = storage
         app.state.document_service = document_service
         app.state.document_processor = document_processor
@@ -235,23 +245,6 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Conservative headers for an API-only service.
-
-    No CSP: this backend serves JSON plus the Swagger page, and a strict policy
-    would break the docs UI without protecting anything real.
-    """
-
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-
-        return response
-
-
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or default_settings
 
@@ -266,6 +259,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     app.add_middleware(SecurityHeadersMiddleware)
+    # Added last, so Starlette runs it first: every downstream log line, span
+    # and error handler sees the request id.
+    app.add_middleware(RequestContextMiddleware)
 
     origins = settings.cors_origins
 

@@ -59,6 +59,42 @@ AGENT_TOOL_CALLS_TOTAL = Counter(
     ["tool", "status"],
 )
 
+# --- LLM -------------------------------------------------------------------
+#
+# Label cardinality note: every label below is drawn from a small closed set —
+# one or two model ids, a handful of statuses, the four registered tool names.
+# Identifiers such as user_id, document_id, conversation_id and request_id are
+# deliberately absent: Prometheus creates one time series per label
+# combination, so an unbounded label turns a single metric into millions of
+# series and eventually takes the scrape target down. Those identifiers belong
+# in structured logs and in Langfuse traces, which are built to hold them.
+
+LLM_REQUESTS_TOTAL = Counter(
+    "llm_requests_total",
+    "LLM generation calls by model and outcome",
+    ["model", "status"],
+)
+
+LLM_REQUEST_DURATION_SECONDS = Histogram(
+    "llm_request_duration_seconds",
+    "LLM generation call duration as observed by the backend",
+    ["model"],
+    buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 40, 80, 160),
+)
+
+LLM_TOKENS_TOTAL = Counter(
+    "llm_tokens_total",
+    "Tokens reported by the inference service, by direction",
+    ["model", "kind"],
+)
+
+AGENT_TOOL_DURATION_SECONDS = Histogram(
+    "agent_tool_duration_seconds",
+    "Tool execution duration",
+    ["tool"],
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10),
+)
+
 # --- auth ------------------------------------------------------------------
 
 AUTH_LOGINS_TOTAL = Counter(

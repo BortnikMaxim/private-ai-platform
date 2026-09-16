@@ -28,6 +28,7 @@ from backend.services.rag_service import RagService
 from backend.services.rate_limiter import RateLimiter
 from backend.services.task_queue import TaskDispatcher
 from backend.services.vector_store import VectorStore
+from backend.tracing import NULL_TRACER, Tracer
 
 # auto_error=False so a missing header raises our own 401 with the standard
 # WWW-Authenticate treatment instead of FastAPI's 403.
@@ -72,6 +73,12 @@ def get_task_dispatcher(request: Request) -> TaskDispatcher:
 
 def get_broker(request: Request) -> BrokerClient:
     return request.app.state.broker
+
+
+def get_tracer(request: Request) -> Tracer:
+    # NULL_TRACER keeps routes working when the lifespan has not run, which is
+    # how the offline tests drive the app.
+    return getattr(request.app.state, "tracer", NULL_TRACER)
 
 
 def get_session_factory(request: Request) -> async_sessionmaker:
@@ -153,6 +160,7 @@ ConversationServiceDep = Annotated[
 DocumentProcessorDep = Annotated[DocumentProcessor, Depends(get_document_processor)]
 TaskDispatcherDep = Annotated[TaskDispatcher, Depends(get_task_dispatcher)]
 BrokerDep = Annotated[BrokerClient, Depends(get_broker)]
+TracerDep = Annotated[Tracer, Depends(get_tracer)]
 SessionFactoryDep = Annotated[async_sessionmaker, Depends(get_session_factory)]
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 RateLimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
