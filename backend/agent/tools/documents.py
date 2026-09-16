@@ -57,6 +57,7 @@ class SearchDocumentsTool(Tool):
             user_id=context.user_id,
             top_k=arguments.top_k,
             document_ids=document_ids,
+            session=context.session,
         )
 
         # Hand the citations back so the endpoint can report them.

@@ -167,14 +167,19 @@ class VectorStore:
 
         results: list[dict[str, Any]] = []
 
-        for point in response.points:
+        for rank, point in enumerate(response.points, start=1):
             payload = point.payload or {}
             score = float(point.score)
 
             results.append(
                 {
+                    # The deterministic point id doubles as the join key when
+                    # dense and lexical results are fused.
+                    "point_id": str(point.id),
                     "score": score,
                     "vector_score": score,
+                    "dense_score": score,
+                    "dense_rank": rank,
                     "user_id": payload.get("user_id"),
                     "document_id": payload.get("document_id"),
                     "filename": payload.get("filename"),

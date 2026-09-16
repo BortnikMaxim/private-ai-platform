@@ -75,6 +75,13 @@ class Source(BaseModel):
     chunk_index: int | None = None
     vector_score: float | None = None
     rerank_score: float | None = None
+    # Hybrid retrieval diagnostics. Each branch reports its own score on its own
+    # scale; they are never blended arithmetically, only fused by rank.
+    dense_score: float | None = None
+    dense_rank: int | None = None
+    lexical_score: float | None = None
+    lexical_rank: int | None = None
+    rrf_score: float | None = None
     # Kept for backward compatibility with the original /rag/ask response.
     score: float | None = None
 
@@ -267,11 +274,20 @@ class RetrieveRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
     candidate_k: int = Field(default=15, ge=1, le=50)
     document_ids: list[uuid.UUID] | None = Field(default=None, max_length=50)
+    # Override the configured retrieval mode for one call; None keeps the
+    # server default. Handy for an A/B look at the same query.
+    mode: Literal["dense", "hybrid"] | None = None
+    lexical_k: int | None = Field(default=None, ge=1, le=200)
+    rrf_k: int | None = Field(default=None, ge=1, le=1000)
 
 
 class RetrieveResponse(BaseModel):
     question: str
+    # Effective mode: "dense" or "hybrid".
+    mode: str = "dense"
     vector_results: list[RetrievedChunk]
+    lexical_results: list[RetrievedChunk] = Field(default_factory=list)
+    fused_results: list[RetrievedChunk] = Field(default_factory=list)
     reranked_results: list[RetrievedChunk]
 
 
@@ -319,6 +335,11 @@ def to_source(chunk: dict[str, Any]) -> Source:
         chunk_index=chunk.get("chunk_index"),
         vector_score=_round(chunk.get("vector_score", chunk.get("score"))),
         rerank_score=_round(chunk.get("rerank_score")),
+        dense_score=_round(chunk.get("dense_score")),
+        dense_rank=chunk.get("dense_rank"),
+        lexical_score=_round(chunk.get("lexical_score")),
+        lexical_rank=chunk.get("lexical_rank"),
+        rrf_score=_round(chunk.get("rrf_score")),
         score=_round(chunk.get("score")),
     )
 

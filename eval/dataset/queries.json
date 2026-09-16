@@ -1,0 +1,43 @@
+{
+  "description": "Golden retrieval set. Relevance is judged at document level: a query is answered correctly if the retrieved chunks come from a document listed in expected_document_ids. Categories mark what each query is meant to stress, so a regression can be traced to a query type rather than an average.",
+  "categories": {
+    "literal": "rare exact token — identifier, version, header name. Hardest for embeddings.",
+    "keyword": "shared vocabulary between query and document. Both branches should cope.",
+    "paraphrase": "same meaning, little or no lexical overlap. Hardest for BM25.",
+    "inflection": "Russian morphological variants of the document's wording.",
+    "cross_lingual": "Russian query against an English document.",
+    "multi_doc": "the answer legitimately spans more than one document."
+  },
+  "queries": [
+    {"id": "q01", "query": "Сколько календарных дней ежегодного отпуска положено сотруднику?", "expected_document_ids": ["hr-vacation"], "category": "keyword"},
+    {"id": "q02", "query": "За какой срок нужно предупредить руководителя, если я хочу уйти отдыхать?", "expected_document_ids": ["hr-vacation"], "category": "paraphrase"},
+    {"id": "q03", "query": "перенос неиспользованных дней отпуска на следующий год", "expected_document_ids": ["hr-vacation"], "category": "keyword"},
+    {"id": "q04", "query": "Что положено при рождении ребёнка?", "expected_document_ids": ["hr-vacation"], "category": "paraphrase"},
+    {"id": "q05", "query": "Сколько длится испытательный срок и как его проходят?", "expected_document_ids": ["hr-onboarding"], "category": "keyword"},
+    {"id": "q06", "query": "Кто помогает новичку в первые месяцы работы?", "expected_document_ids": ["hr-onboarding"], "category": "paraphrase"},
+    {"id": "q07", "query": "обязательные курсы обучения для новых сотрудников", "expected_document_ids": ["hr-onboarding"], "category": "keyword"},
+    {"id": "q08", "query": "Какая минимальная длина пароля?", "expected_document_ids": ["sec-access"], "category": "keyword"},
+    {"id": "q09", "query": "Нужен ли второй фактор при входе администратору?", "expected_document_ids": ["sec-access"], "category": "paraphrase"},
+    {"id": "q10", "query": "пересмотр прав доступа ежеквартально", "expected_document_ids": ["sec-access"], "category": "keyword"},
+    {"id": "q11", "query": "Что происходит с учётными записями когда человек уходит из компании?", "expected_document_ids": ["sec-access"], "category": "paraphrase"},
+    {"id": "q12", "query": "INC-2026-017", "expected_document_ids": ["inc-2026-017"], "category": "literal"},
+    {"id": "q13", "query": "Из-за чего упал платёжный шлюз в марте?", "expected_document_ids": ["inc-2026-017"], "category": "paraphrase"},
+    {"id": "q14", "query": "релиз 4.12.0 пул соединений", "expected_document_ids": ["inc-2026-017"], "category": "literal"},
+    {"id": "q15", "query": "X-RateLimit-Remaining", "expected_document_ids": ["api-ratelimit"], "category": "literal"},
+    {"id": "q16", "query": "How many requests per minute can a client send?", "expected_document_ids": ["api-ratelimit"], "category": "keyword"},
+    {"id": "q17", "query": "Что делать клиенту если пришёл ответ 429?", "expected_document_ids": ["api-ratelimit"], "category": "cross_lingual"},
+    {"id": "q18", "query": "token_expired", "expected_document_ids": ["api-auth"], "category": "literal"},
+    {"id": "q19", "query": "How long is an access token valid?", "expected_document_ids": ["api-auth"], "category": "keyword"},
+    {"id": "q20", "query": "Как часто нужно менять секрет клиента?", "expected_document_ids": ["api-auth"], "category": "cross_lingual"},
+    {"id": "q21", "query": "Какая выручка была в третьем квартале?", "expected_document_ids": ["fin-q3"], "category": "keyword"},
+    {"id": "q22", "query": "Насколько прибыльной оказалась компания за квартал?", "expected_document_ids": ["fin-q3"], "category": "paraphrase"},
+    {"id": "q23", "query": "закупки свыше 5 миллионов рублей согласование", "expected_document_ids": ["proc-vendors"], "category": "keyword"},
+    {"id": "q24", "query": "Сколько коммерческих предложений нужно собрать для крупной покупки?", "expected_document_ids": ["proc-vendors"], "category": "inflection"},
+    {"id": "q25", "query": "ROC AUC модели оттока", "expected_document_ids": ["ml-model-card"], "category": "literal"},
+    {"id": "q26", "query": "Насколько хорошо модель работает на новых клиентах?", "expected_document_ids": ["ml-model-card"], "category": "cross_lingual"},
+    {"id": "q27", "query": "Какое время реакции на инцидент уровня P1?", "expected_document_ids": ["sla-support"], "category": "keyword"},
+    {"id": "q28", "query": "Что компания обещает по доступности сервиса и что будет если не уложится?", "expected_document_ids": ["sla-support"], "category": "paraphrase"},
+    {"id": "q29", "query": "Какие правила действуют для паролей и для доступа к API?", "expected_document_ids": ["sec-access", "api-auth"], "category": "multi_doc"},
+    {"id": "q30", "query": "Что известно про отток клиентов?", "expected_document_ids": ["fin-q3", "ml-model-card"], "category": "multi_doc"}
+  ]
+}

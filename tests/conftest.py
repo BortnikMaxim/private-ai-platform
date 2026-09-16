@@ -31,6 +31,7 @@ from backend.services.auth_service import AuthService
 from backend.services.conversation_service import ConversationService
 from backend.services.document_processor import DocumentProcessor
 from backend.services.document_service import DocumentService
+from backend.services.lexical_index import LexicalRetriever
 from backend.services.rag_service import RagService
 from backend.services.rate_limiter import RateLimiter
 from backend.services.storage import DocumentStorage
@@ -158,8 +159,13 @@ class FakeVectorStore:
             score = round(1.0 - offset * 0.01, 4)
             results.append(
                 {
+                    # Mirrors the real store: the point id is the key the
+                    # dense and lexical branches are fused on.
+                    "point_id": point["point_id"],
                     "score": score,
                     "vector_score": score,
+                    "dense_score": score,
+                    "dense_rank": offset + 1,
                     "user_id": point.get("user_id"),
                     "document_id": point["document_id"],
                     "filename": point["filename"],
@@ -385,8 +391,23 @@ def storage(settings) -> DocumentStorage:
 
 
 @pytest.fixture
-def rag_service(embeddings, vector_store, settings) -> RagService:
-    return RagService(embeddings=embeddings, vector_store=vector_store, settings=settings)
+def lexical_index(settings) -> LexicalRetriever:
+    """Real BM25 retriever — it reads the SQLite test corpus, no mocking needed."""
+    return LexicalRetriever(
+        k1=settings.bm25_k1,
+        b=settings.bm25_b,
+        stemming=settings.bm25_stemming,
+    )
+
+
+@pytest.fixture
+def rag_service(embeddings, vector_store, settings, lexical_index) -> RagService:
+    return RagService(
+        embeddings=embeddings,
+        vector_store=vector_store,
+        settings=settings,
+        lexical=lexical_index,
+    )
 
 
 @pytest.fixture

@@ -86,8 +86,26 @@ class Settings(BaseSettings):
     preload_models: bool = True
 
     # --- RAG ------------------------------------------------------------
+    # "dense"  — embeddings only (the pipeline before hybrid retrieval)
+    # "hybrid" — dense + BM25 fused with Reciprocal Rank Fusion
+    retrieval_mode: Literal["dense", "hybrid"] = "hybrid"
+
     rag_top_k: int = Field(default=5, ge=1, le=50)
+    # Candidates pulled from Qdrant.
     rag_candidate_k: int = Field(default=15, ge=1, le=200)
+    # Candidates pulled from the BM25 index.
+    rag_lexical_candidate_k: int = Field(default=15, ge=1, le=200)
+    # RRF damping: larger values flatten each list's head, so agreement between
+    # the two branches counts for more than one branch's single best hit.
+    rag_rrf_k: int = Field(default=60, ge=1, le=1000)
+    # Upper bound on what reaches the cross-encoder — the expensive stage.
+    rag_rerank_candidate_k: int = Field(default=25, ge=1, le=200)
+    # Okapi BM25 parameters.
+    bm25_k1: float = Field(default=1.5, ge=0.0, le=5.0)
+    bm25_b: float = Field(default=0.75, ge=0.0, le=1.0)
+    # Snowball stemming, chosen per token by script. Russian inflection makes
+    # unstemmed BM25 nearly useless on this corpus.
+    bm25_stemming: bool = True
     chunk_size_words: int = Field(default=220, ge=20)
     chunk_overlap_words: int = Field(default=40, ge=0)
     # Hard cap on the grounded context handed to the LLM. The inference

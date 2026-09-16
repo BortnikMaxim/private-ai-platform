@@ -29,7 +29,8 @@ flowchart TD
 
     Backend --> Postgres[(PostgreSQL 16<br/>users, conversations,<br/>messages, documents, chunks)]
     Backend --> Redis[(Redis<br/>cache, Celery results)]
-    Backend -->|filter user_id| Qdrant[(Qdrant<br/>vector collection 'documents')]
+    Backend -->|dense: filter user_id| Qdrant[(Qdrant<br/>vector collection 'documents')]
+    Backend -->|lexical: BM25 over chunks| Postgres
     Backend -->|X-API-Key, :8001| Inference[Inference API FastAPI]
     Backend -->|enqueue document_id| Rabbit[(RabbitMQ<br/>queue 'documents')]
     Backend -->|write PDF| Files[/data/uploads/]
@@ -144,7 +145,9 @@ backend/
     chunking.py            PDF extraction + word-window chunking (pure)
     embeddings.py          e5 encoder + cross-encoder reranker (loaded once)
     vector_store.py        Qdrant access, payload shape, document filtering
-    rag_service.py         retrieve -> rerank -> build grounded context
+    lexical_index.py       Okapi BM25 over document_chunks, per-tenant cache
+    fusion.py              Reciprocal Rank Fusion of the two branches
+    rag_service.py         dense + lexical -> RRF -> rerank -> context
     storage.py             local PDF storage, traversal-safe paths
     document_service.py    validation, CRUD, enqueue, delete
     document_processor.py  the heavy pipeline the worker runs
@@ -161,6 +164,11 @@ backend/
     dispatch.py            Celery implementation of TaskDispatcher
   scripts/
     reset_qdrant.py        manual maintenance for the vector collection
+    create_admin.py        first administrator account
+    eval_retrieval.py      offline retrieval evaluation harness
+eval/
+  dataset/                 golden corpus and query set (reviewable JSON)
+  results/                 machine-readable evaluation output
 inference/               MLX/Gemma service (unchanged)
 migrations/              Alembic (async)
 tests/                   offline unit tests + opt-in integration tests
@@ -674,6 +682,154 @@ the token and every protected route becomes callable from the browser.
 
 ---
 
+## Hybrid retrieval
+
+```
+query ─┬─ dense   multilingual-e5-small → Qdrant   (tenant filter inside the engine)
+       └─ lexical Okapi BM25 → document_chunks     (tenant filter inside the SQL)
+              ↓
+      Reciprocal Rank Fusion
+              ↓
+      CrossEncoder rerank
+              ↓
+          top_k chunks
+```
+
+`RETRIEVAL_MODE` selects `hybrid` (default) or `dense`. `dense` is exactly the
+pipeline this project had before the lexical branch existed, so the two can be
+compared on the same corpus without touching code.
+
+### The lexical branch
+
+BM25 runs over the chunk text already stored in `document_chunks`, so there is
+no second copy of the corpus and no extra service. The index is built per tenant
+and cached in the process; a cheap probe — chunk count plus newest chunk
+timestamp — rebuilds it after an ingest or a delete, which is how a Celery
+worker's writes become visible to the API process.
+
+Tokenisation is Unicode-aware and Snowball-stemmed, with the language chosen per
+token by script. Russian is heavily inflected: unstemmed, the query "проекты"
+does not match a chunk containing "проект", which makes BM25 decorative on a
+Russian corpus. Identifiers such as `INC-2026-017` are left unstemmed so they
+stay exact.
+
+**Scale limit, stated plainly:** the index holds one tenant's chunks in memory
+and is rebuilt when the corpus changes. That suits a self-hosted personal
+corpus. A large deployment wants Postgres FTS, OpenSearch or Qdrant sparse
+vectors — `LexicalRetriever` is the seam where that swap happens.
+
+### Why Reciprocal Rank Fusion
+
+Cosine similarity and BM25 live on different, unbounded, query-dependent scales.
+Min-max normalising them into a weighted sum invents a comparability that does
+not exist: the same BM25 score means something different for a one-word query
+than for a ten-word one, and the normalisation ends up dominated by whichever
+branch returned an outlier.
+
+RRF reads only *positions*. Each branch contributes `1 / (k + rank)`, the
+contributions are summed per chunk, and no score scale enters the result
+(Cormack et al., 2009). `RAG_RRF_K` controls how sharply each list's head is
+favoured; a larger value flattens it, so agreement between branches matters more
+than one branch's single best hit.
+
+The raw scores are carried through untouched as diagnostics — `dense_score`,
+`dense_rank`, `lexical_score`, `lexical_rank`, `rrf_score`, `rerank_score` — and
+are never mixed arithmetically. `POST /rag/retrieve` returns every stage side by
+side so a quality drop can be traced to the stage that caused it:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/rag/retrieve \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"question": "складская логистика", "mode": "hybrid"}' \
+  | jq '{mode, dense: (.vector_results|length), lexical: (.lexical_results|length), fused: (.fused_results|length)}'
+```
+
+---
+
+## Retrieval evaluation
+
+A golden set of 30 queries over an 18-document synthetic corpus
+(`eval/dataset/`). Relevance is judged at **document level**: a query is
+answered when a retrieved chunk belongs to one of its `expected_document_ids`.
+Queries are tagged by what they stress — `literal`, `keyword`, `paraphrase`,
+`inflection`, `cross_lingual`, `multi_doc` — so a regression can be traced to a
+query type rather than to an average.
+
+The dataset carries **no reference answers**, so no answer-quality, relevance or
+faithfulness metric is reported. Deriving one from document labels would be
+inventing a number the data cannot support.
+
+### Reproducing
+
+```bash
+docker compose up -d          # Qdrant + PostgreSQL are required
+alembic upgrade head
+python -m backend.scripts.eval_retrieval --details
+```
+
+The harness indexes the corpus into a throwaway Qdrant collection and a
+throwaway PostgreSQL tenant, runs every configuration, writes
+`eval/results/latest.json` and deletes both afterwards. No LLM is called, so the
+latency figures contain no generation time. The first three queries of each
+configuration are a warm-up and excluded from the timings.
+
+### Measured results
+
+Generated by the command above on an M-series MacBook Pro; 18 documents,
+18 chunks, 30 queries. `p50`/`p95` are retrieval latency only.
+
+| config | MRR | R@1 | R@3 | R@5 | Hit@5 | p50 ms | p95 ms |
+|---|---|---|---|---|---|---|---|
+| dense | 0.888 | 0.833 | 0.883 | 0.883 | 0.900 | 16.4 | 25.1 |
+| dense+rerank | 0.978 | 0.933 | 0.983 | 0.983 | 1.000 | 111.9 | 126.2 |
+| hybrid | 0.879 | 0.833 | 0.850 | 0.883 | 0.900 | 18.4 | 19.8 |
+| hybrid+rerank | **0.978** | **0.933** | **0.983** | **0.983** | **1.000** | 113.8 | 130.1 |
+
+Recall@5 by category:
+
+| category | dense | dense+rerank | hybrid | hybrid+rerank |
+|---|---|---|---|---|
+| cross_lingual | 0.000 | 1.000 | 0.000 | 1.000 |
+| inflection | 1.000 | 1.000 | 1.000 | 1.000 |
+| keyword | 1.000 | 1.000 | 1.000 | 1.000 |
+| literal | 1.000 | 1.000 | 1.000 | 1.000 |
+| multi_doc | 0.750 | 0.750 | 0.750 | 0.750 |
+| paraphrase | 1.000 | 1.000 | 1.000 | 1.000 |
+
+### What the numbers actually say
+
+**Hybrid retrieval does not improve this corpus.** On its own it is a wash —
+MRR −0.009, Recall@5 unchanged. Only 4 of 30 queries change at all, and they
+cancel out:
+
+| query | category | dense RR | hybrid RR | |
+|---|---|---|---|---|
+| q05 "Сколько длится испытательный срок" | keyword | 0.500 | 1.000 | BM25 helped |
+| q17 "Что делать клиенту если пришёл ответ 429?" | cross_lingual | 0.000 | 0.167 | BM25 helped — `429` is a shared literal |
+| q02 "За какой срок нужно предупредить руководителя" | paraphrase | 1.000 | 0.200 | BM25 hurt — pulled in a lexically similar distractor |
+| q20 "Как часто нужно менять секрет клиента?" | cross_lingual | 0.143 | 0.000 | BM25 hurt |
+
+The reason is corpus size, not a broken implementation: with 18 documents the
+dense branch already scores 1.000 on `literal` and `keyword` — precisely the
+categories BM25 exists to rescue — so there is no headroom left for it to
+recover, while its false positives still cost something.
+
+**The cross-encoder is what carries this pipeline:** +0.090 MRR and +0.100
+Recall@5, and it fixes every one of the four remaining failures, including all
+three `cross_lingual` queries that both first-stage retrievers miss entirely. It
+costs roughly 95 ms per query.
+
+`hybrid+rerank` and `dense+rerank` are **identical** on every metric here. Hybrid
+remains the default because it costs about 2 ms, never loses once reranking is
+on, and covers the rare-literal failure mode that an 18-document corpus is too
+small to exercise. Set `RETRIEVAL_MODE=dense` for the pre-hybrid behaviour.
+
+`multi_doc` sits at 0.750 for every configuration: those queries have two
+relevant documents and the pipeline reliably finds one of them. That is a
+property of the metric (recall over two labels), not a failure of retrieval.
+
+---
+
 ## Agent Architecture
 
 `POST /conversations/{id}/agent` answers a turn through a LangGraph state
@@ -839,8 +995,14 @@ All settings come from environment variables (or `.env`); see `.env.example`.
 | `QDRANT_COLLECTION` | `documents` | vector collection name |
 | `INFERENCE_URL` | `http://127.0.0.1:8001` | inference service base URL |
 | `INFERENCE_API_KEY` | *(empty)* | sent as `X-API-Key`; must be set |
+| `RETRIEVAL_MODE` | `hybrid` | `hybrid` (dense + BM25 + RRF) or `dense` |
 | `RAG_TOP_K` | `5` | chunks kept after reranking |
-| `RAG_CANDIDATE_K` | `15` | chunks fetched from Qdrant before reranking |
+| `RAG_CANDIDATE_K` | `15` | candidates fetched from Qdrant |
+| `RAG_LEXICAL_CANDIDATE_K` | `15` | candidates fetched from the BM25 index |
+| `RAG_RRF_K` | `60` | RRF damping; larger favours branch agreement |
+| `RAG_RERANK_CANDIDATE_K` | `25` | cap on what reaches the cross-encoder |
+| `BM25_K1` / `BM25_B` | `1.5` / `0.75` | Okapi BM25 parameters |
+| `BM25_STEMMING` | `true` | Snowball stemming, language picked per token |
 | `CHAT_HISTORY_LIMIT` | `20` | messages replayed to the model |
 | `AGENT_MAX_STEPS` | `6` | hard ceiling on graph nodes per run |
 | `AGENT_ROUTER_TEMPERATURE` | `0.0` | structured calls want determinism |
@@ -987,6 +1149,7 @@ ruff check backend tests         # lint
 pytest -q                        # offline unit tests
 pytest -m integration            # needs live Postgres, Qdrant and RabbitMQ
 alembic check                    # models and migrations agree
+python -m backend.scripts.eval_retrieval   # retrieval metrics (needs Qdrant + Postgres)
 ```
 
 Unit tests never touch the network: the models, Qdrant, Redis, RabbitMQ and the
@@ -1069,6 +1232,20 @@ alembic upgrade head
   documents or per-document ACLs — one user is one tenant.
 - **Rows adopted by migration 0003** belong to the locked
   `system@local.invalid` account until you reassign them (see above).
+- **Hybrid retrieval is not yet earning its keep.** On the current 18-document
+  evaluation corpus it is metric-neutral (see
+  [Retrieval evaluation](#retrieval-evaluation)). It is kept on because it is
+  nearly free and covers a failure mode the corpus is too small to show, not
+  because a measurement supports it.
+- **The BM25 index is in-process and in-memory.** It is rebuilt per tenant when
+  the corpus changes, which is fine for a personal corpus and wrong for a large
+  multi-tenant one.
+- **No lexical-branch metrics on a realistic corpus.** The golden set is
+  synthetic, written alongside the system, and 30 queries is small enough that a
+  single query moves MRR by 0.03. Treat the numbers as a regression guard, not
+  as a benchmark.
+- **No answer-quality evaluation.** The dataset has no reference answers, so
+  faithfulness, relevance and correctness of generated text are unmeasured.
 - **No agent tracing UI.** LangSmith is installed transitively but not
   configured, and no checkpointer is attached — the graph is stateless between
   turns and memory comes from the `messages` table.

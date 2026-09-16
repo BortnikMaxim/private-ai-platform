@@ -24,6 +24,7 @@ from backend.services.document_processor import DocumentProcessor
 from backend.services.document_service import DocumentService
 from backend.services.embeddings import EmbeddingService
 from backend.services.inference_client import InferenceClient
+from backend.services.lexical_index import LexicalRetriever
 from backend.services.rag_service import RagService
 from backend.services.rate_limiter import RateLimiter
 from backend.services.storage import DocumentStorage
@@ -84,10 +85,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             reranker_model=settings.reranker_model,
         )
 
+        lexical_index = LexicalRetriever(
+            k1=settings.bm25_k1,
+            b=settings.bm25_b,
+            stemming=settings.bm25_stemming,
+        )
+
         rag_service = RagService(
             embeddings=embeddings,
             vector_store=vector_store,
             settings=settings,
+            lexical=lexical_index,
         )
 
         storage = DocumentStorage(settings.upload_dir)
@@ -150,6 +158,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.inference_client = inference_client
         app.state.embeddings = embeddings
         app.state.rag_service = rag_service
+        app.state.lexical_index = lexical_index
         app.state.storage = storage
         app.state.document_service = document_service
         app.state.document_processor = document_processor

@@ -209,8 +209,16 @@ class AgentNodes:
 
         return {"step_count": step, "final_answer": answer}
 
-    async def rag_search(self, state: AgentState) -> dict[str, Any]:
-        """Retrieve grounding chunks through the existing RagService."""
+    async def rag_search(
+        self,
+        state: AgentState,
+        config: RunnableConfig | None = None,
+    ) -> dict[str, Any]:
+        """Retrieve grounding chunks through the existing RagService.
+
+        The session arrives through LangGraph's config, exactly as it does for
+        tool execution; without it the hybrid branch degrades to dense.
+        """
         node = "rag_search"
 
         try:
@@ -225,6 +233,7 @@ class AgentNodes:
             question=state.get("user_message", ""),
             user_id=state.get("user_id", ""),
             document_ids=document_ids,
+            session=(config or {}).get("configurable", {}).get("session"),
         )
 
         agent_event(

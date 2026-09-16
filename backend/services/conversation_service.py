@@ -189,6 +189,7 @@ class ConversationService:
                 top_k=top_k,
                 candidate_k=candidate_k,
                 document_ids=[str(value) for value in document_ids or []] or None,
+                session=session,
             )
             context = self.rag.build_context(sources)
 
