@@ -110,6 +110,7 @@ class AgentService:
     async def run(
         self,
         conversation_id: uuid.UUID | str,
+        user_id: uuid.UUID | str,
         user_message: str,
         chat_history: list[dict[str, str]] | None = None,
         use_rag: bool = False,
@@ -119,6 +120,7 @@ class AgentService:
         key = str(conversation_id)
         state = initial_state(
             conversation_id=key,
+            user_id=str(user_id),
             user_message=user_message,
             chat_history=chat_history,
             use_rag=use_rag,

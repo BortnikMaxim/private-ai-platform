@@ -11,11 +11,12 @@ async def create_conversation(client, title="Тестовый диалог"):
     return response.json()
 
 
-async def test_create_and_get_conversation(client):
+async def test_create_and_get_conversation(client, user):
     created = await create_conversation(client)
 
     assert created["title"] == "Тестовый диалог"
-    assert created["user_id"] is None
+    # Ownership is taken from the token, not from the request body.
+    assert created["user_id"] == str(user.id)
 
     response = await client.get(f"/conversations/{created['id']}")
 

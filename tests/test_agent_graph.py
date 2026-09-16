@@ -26,9 +26,13 @@ def tool_reply(tool: str, **arguments) -> str:
     return json.dumps({"tool": tool, "arguments": arguments})
 
 
+TENANT = uuid.uuid4()
+
+
 async def run(agent_service, message: str, **kwargs):
     return await agent_service.run(
         conversation_id=kwargs.pop("conversation_id", uuid.uuid4()),
+        user_id=kwargs.pop("user_id", TENANT),
         user_message=message,
         chat_history=kwargs.pop("chat_history", [{"role": "user", "content": message}]),
         **kwargs,
@@ -120,12 +124,14 @@ async def test_rag_route_returns_sources_and_grounded_answer(
     agent_service,
     inference,
     seeded_document,
+    user,
 ):
     inference.script(route_reply("rag_search"), "Проект Борей — логистика.")
 
     state = await run(
         agent_service,
         "Какие проекты описаны?",
+        user_id=user.id,
         use_rag=True,
     )
 
@@ -143,12 +149,14 @@ async def test_rag_route_respects_document_scope(
     inference,
     seeded_document,
     vector_store,
+    user,
 ):
     inference.script(route_reply("rag_search"), "Ответ")
 
     await run(
         agent_service,
         "вопрос",
+        user_id=user.id,
         use_rag=True,
         document_ids=[str(seeded_document)],
     )
@@ -201,6 +209,7 @@ async def test_document_metadata_tool_route(
     inference,
     seeded_document,
     session_factory,
+    user,
 ):
     inference.script(
         route_reply("tool", "get_document_metadata"),
@@ -211,6 +220,7 @@ async def test_document_metadata_tool_route(
     async with session_factory() as session:
         state = await agent_service.run(
             conversation_id=uuid.uuid4(),
+            user_id=user.id,
             user_message="Что за документ?",
             chat_history=[],
             session=session,
@@ -225,6 +235,7 @@ async def test_search_documents_tool_surfaces_sources(
     agent_service,
     inference,
     seeded_document,
+    user,
 ):
     inference.script(
         route_reply("tool", "search_documents"),
@@ -232,7 +243,7 @@ async def test_search_documents_tool_surfaces_sources(
         "Нашёл проекты.",
     )
 
-    state = await run(agent_service, "Найди проекты")
+    state = await run(agent_service, "Найди проекты", user_id=user.id)
 
     assert state["route"] == "tool"
     assert state["retrieved_sources"], "tool-produced chunks must be citable"
@@ -393,7 +404,6 @@ async def test_a_normal_run_stays_well_inside_the_step_budget(
 async def test_step_count_covers_the_longest_branch(
     agent_service,
     inference,
-    seeded_document,
 ):
     inference.script(
         route_reply("tool", "calculator"),
@@ -415,6 +425,7 @@ async def test_step_count_covers_the_longest_branch(
 def test_initial_state_is_json_serialisable():
     state = initial_state(
         conversation_id=str(uuid.uuid4()),
+        user_id=str(uuid.uuid4()),
         user_message="привет",
         chat_history=[{"role": "user", "content": "привет"}],
         use_rag=True,

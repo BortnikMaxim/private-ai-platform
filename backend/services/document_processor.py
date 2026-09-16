@@ -115,7 +115,7 @@ class DocumentProcessor:
         key = str(document_id)
 
         with stage("load", key, task_id) as info:
-            filename = await self._claim(session_factory, document_id)
+            filename, owner_id = await self._claim(session_factory, document_id)
             info["filename_len"] = len(filename)
 
         with stage("read_source", key, task_id) as info:
@@ -152,6 +152,9 @@ class DocumentProcessor:
             {
                 "point_id": point_id_for(document_id, record["chunk_index"]),
                 "vector": vector,
+                # The tenant tag every retrieval filters on. Taken from the
+                # document row, so a retry or reprocess keeps the same owner.
+                "user_id": owner_id,
                 "document_id": key,
                 "filename": filename,
                 "page": record["page"],
@@ -200,8 +203,13 @@ class DocumentProcessor:
         self,
         session_factory: async_sessionmaker,
         document_id: uuid.UUID,
-    ) -> str:
-        """Verify the document exists and is still queued; return its filename."""
+    ) -> tuple[str, str]:
+        """Check the document is still queued; return ``(filename, user_id)``.
+
+        Ownership is read from the row, never taken from the task payload. The
+        task carries only a document id, so a forged message cannot make a
+        worker index somebody else's chunks under the wrong tenant.
+        """
         async with self._session(session_factory) as session:
             document = await session.get(Document, document_id)
 
@@ -215,7 +223,7 @@ class DocumentProcessor:
                     f"Document is already in status '{document.status}'"
                 )
 
-            return document.filename
+            return document.filename, str(document.user_id)
 
     async def _assert_still_wanted(
         self,

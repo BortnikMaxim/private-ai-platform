@@ -2,6 +2,8 @@ import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -11,12 +13,19 @@ from sqlalchemy import (
     Uuid,
     func,
 )
+from sqlalchemy import (
+    true as sa_true,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.db import Base
 
 MESSAGE_ROLES = ("system", "user", "assistant")
 DOCUMENT_STATUSES = ("processing", "ready", "failed")
+
+ROLE_USER = "user"
+ROLE_ADMIN = "admin"
+USER_ROLES = (ROLE_USER, ROLE_ADMIN)
 
 
 def _utcnow() -> datetime:
@@ -38,14 +47,52 @@ class User(Base):
         index=True,
     )
 
+    # Argon2id digest. Never leaves the service: no schema exposes it.
+    password_hash: Mapped[str] = mapped_column(String(255))
+
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=sa_true(),
+    )
+
+    role: Mapped[str] = mapped_column(
+        String(20),
+        default=ROLE_USER,
+        server_default=ROLE_USER,
+        index=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utcnow,
         server_default=func.now(),
     )
 
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        onupdate=_utcnow,
+        server_default=func.now(),
+    )
+
     conversations: Mapped[list["Conversation"]] = relationship(
         back_populates="user",
+    )
+
+    documents: Mapped[list["Document"]] = relationship(
+        back_populates="user",
+    )
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == ROLE_ADMIN
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('user', 'admin')",
+            name="ck_users_role",
+        ),
     )
 
 
@@ -58,11 +105,12 @@ class Conversation(Base):
         default=uuid.uuid4,
     )
 
-    # Nullable until user authentication lands.
-    user_id: Mapped[uuid.UUID | None] = mapped_column(
+    # The tenant boundary. Never nullable: an unowned conversation would be
+    # invisible to every scoped query and reachable by none.
+    user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=True,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
         index=True,
     )
 
@@ -84,7 +132,7 @@ class Conversation(Base):
         server_default=func.now(),
     )
 
-    user: Mapped["User | None"] = relationship(
+    user: Mapped["User"] = relationship(
         back_populates="conversations",
     )
 
@@ -93,6 +141,11 @@ class Conversation(Base):
         cascade="all, delete-orphan",
         order_by="Message.created_at",
         passive_deletes=True,
+    )
+
+    __table_args__ = (
+        # The list endpoint is "my conversations, newest activity first".
+        Index("ix_conversations_user_updated", "user_id", "updated_at"),
     )
 
 
@@ -139,6 +192,14 @@ class Document(Base):
         default=uuid.uuid4,
     )
 
+    # The tenant boundary, mirrored into every Qdrant payload.
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
     # Sanitised name used internally; original_filename is what the user sent.
     filename: Mapped[str] = mapped_column(String(255))
     original_filename: Mapped[str] = mapped_column(String(255))
@@ -172,10 +233,16 @@ class Document(Base):
         server_default=func.now(),
     )
 
+    user: Mapped["User"] = relationship(back_populates="documents")
+
     chunks: Mapped[list["DocumentChunk"]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",
         passive_deletes=True,
+    )
+
+    __table_args__ = (
+        Index("ix_documents_user_created", "user_id", "created_at"),
     )
 
 

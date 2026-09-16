@@ -67,6 +67,49 @@ class TransientProcessingError(AppError):
     default_detail = "Temporary processing failure"
 
 
+class InvalidTokenError(AppError):
+    """Missing, malformed or expired bearer token."""
+
+    status_code = 401
+    default_detail = "Could not validate credentials"
+
+
+class InvalidCredentialsError(AppError):
+    """Wrong email or wrong password — deliberately indistinguishable."""
+
+    status_code = 401
+    default_detail = "Incorrect email or password"
+
+
+class InactiveUserError(AppError):
+    status_code = 403
+    default_detail = "User account is inactive"
+
+
+class PermissionDeniedError(AppError):
+    status_code = 403
+    default_detail = "Insufficient privileges"
+
+
+class EmailAlreadyRegisteredError(AppError):
+    status_code = 409
+    default_detail = "Email is already registered"
+
+
+class WeakPasswordError(AppError):
+    status_code = 422
+    default_detail = "Password does not meet the policy"
+
+
+class RateLimitExceededError(AppError):
+    status_code = 429
+    default_detail = "Too many requests"
+
+    def __init__(self, detail: str | None = None, retry_after: int = 60) -> None:
+        super().__init__(detail)
+        self.retry_after = retry_after
+
+
 class AgentUnavailableError(AppError):
     """The agent layer is not wired up in this deployment."""
 

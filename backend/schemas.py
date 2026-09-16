@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 # ---------------------------------------------------------------------------
 # Shared
@@ -11,6 +11,59 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr = Field(max_length=320)
+    # Bounds only; the configured policy is enforced server side so the limits
+    # stay in one place.
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr = Field(max_length=320)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class UserRead(BaseModel):
+    """Everything about a user that is safe to return. No password_hash.
+
+    ``email`` is a plain ``str``, not ``EmailStr``: this is an output model, and
+    re-validating a value that is already stored turns a stricter future
+    validator into a 500. Migration 0003 deliberately creates
+    ``system@local.invalid`` — an RFC 2606 address that can never be delivered
+    to, and that ``EmailStr`` therefore rejects. Validation belongs on the way
+    in, which is where ``RegisterRequest`` and ``LoginRequest`` do it.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    email: str
+    is_active: bool
+    role: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class UserListResponse(BaseModel):
+    items: list[UserRead]
+    total: int
+
+
+class SetActiveRequest(BaseModel):
+    is_active: bool
 
 
 class Source(BaseModel):
@@ -112,15 +165,16 @@ class DeleteResponse(BaseModel):
 
 
 class ConversationCreate(BaseModel):
+    # No user_id: ownership is taken from the bearer token so a caller can
+    # never create a conversation on somebody else's behalf.
     title: str = Field(default="New conversation", min_length=1, max_length=255)
-    user_id: uuid.UUID | None = None
 
 
 class ConversationRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    user_id: uuid.UUID | None = None
+    user_id: uuid.UUID
     title: str
     created_at: datetime
     updated_at: datetime

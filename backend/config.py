@@ -1,8 +1,19 @@
+import logging
+import secrets
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+# Values that must never be accepted as a real signing key.
+WEAK_JWT_SECRETS = frozenset(
+    {"", "secret", "changeme", "change-me", "please-change-me", "dev", "test"}
+)
+MIN_JWT_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -20,8 +31,34 @@ class Settings(BaseSettings):
 
     # --- application ---------------------------------------------------
     app_name: str = "Private AI Platform API"
-    app_version: str = "0.3.0"
+    app_version: str = "0.4.0"
     log_level: str = "INFO"
+    # "production" turns on the strict checks below. Anything else is a
+    # developer machine.
+    app_env: Literal["dev", "test", "production"] = "dev"
+
+    # --- authentication --------------------------------------------------
+    # Never has a usable default: production refuses to start without one, and
+    # a developer machine gets a random per-process key (see the validator).
+    jwt_secret_key: str = ""
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = Field(default=60, ge=1, le=1440)
+    jwt_issuer: str = "private-ai-platform"
+
+    password_min_length: int = Field(default=10, ge=8, le=64)
+    # Argon2 hashes the whole input, but an unbounded password is a cheap DoS.
+    password_max_length: int = Field(default=128, ge=64, le=1024)
+
+    # Comma separated. Empty means "no browser origin is allowed", which is the
+    # right default for an API-only service.
+    cors_allowed_origins: str = ""
+
+    # --- rate limiting ----------------------------------------------------
+    rate_limit_enabled: bool = True
+    rate_limit_auth_per_minute: int = Field(default=10, ge=1, le=10_000)
+    rate_limit_chat_per_minute: int = Field(default=30, ge=1, le=10_000)
+    rate_limit_upload_per_minute: int = Field(default=10, ge=1, le=10_000)
+    rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
 
     # --- infrastructure ------------------------------------------------
     database_url: str = (
@@ -105,6 +142,51 @@ class Settings(BaseSettings):
     @property
     def max_upload_size_bytes(self) -> int:
         return self.max_upload_size_mb * 1024 * 1024
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.cors_allowed_origins.split(",")
+            if origin.strip()
+        ]
+
+    @model_validator(mode="after")
+    def _validate_jwt_secret(self) -> "Settings":
+        """Refuse a weak signing key in production; improvise one in dev.
+
+        A hardcoded fallback would be worse than either: it would silently ship
+        a publicly known key. Production fails loudly instead, and a developer
+        machine gets a random key that lasts as long as the process — tokens do
+        not survive a restart, which is the intended nudge to set the variable.
+        """
+        weak = (
+            self.jwt_secret_key.strip().lower() in WEAK_JWT_SECRETS
+            or len(self.jwt_secret_key) < MIN_JWT_SECRET_LENGTH
+        )
+
+        if not weak:
+            return self
+
+        if self.is_production:
+            raise ValueError(
+                "JWT_SECRET_KEY must be set to at least "
+                f"{MIN_JWT_SECRET_LENGTH} characters when APP_ENV=production. "
+                'Generate one with: python -c "import secrets; '
+                'print(secrets.token_urlsafe(48))"'
+            )
+
+        object.__setattr__(self, "jwt_secret_key", secrets.token_urlsafe(48))
+        logger.warning(
+            "JWT_SECRET_KEY is unset or too short; using a random per-process "
+            "key. Issued tokens become invalid when this process restarts."
+        )
+
+        return self
 
 
 @lru_cache

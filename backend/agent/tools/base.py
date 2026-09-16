@@ -34,6 +34,8 @@ class ToolContext:
     rag_service: Any = None
     document_service: Any = None
     settings: Any = None
+    # The authenticated tenant. Tools that touch stored data must scope by it.
+    user_id: str | None = None
     document_ids: list[str] | None = None
     # Populated by tools that produce citable chunks.
     sources: list[dict[str, Any]] | None = None

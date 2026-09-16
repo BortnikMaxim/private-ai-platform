@@ -5,6 +5,7 @@ retrieval, embedding or Qdrant logic here — ``search_documents`` is a thin
 orchestration wrapper around :class:`~backend.services.rag_service.RagService`.
 """
 
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -39,7 +40,13 @@ class SearchDocumentsTool(Tool):
         if context.rag_service is None:
             raise ToolError("document search is not available")
 
+        if not context.user_id:
+            # Without a tenant this would search everything. Refuse instead.
+            raise ToolError("document search requires an authenticated user")
+
         # An explicit argument wins; otherwise inherit the request's scope.
+        # Either way the tenant filter below still applies, so a model that
+        # invents a foreign document id simply gets nothing back.
         document_ids = arguments.document_ids or context.document_ids or None
 
         if document_ids:
@@ -47,6 +54,7 @@ class SearchDocumentsTool(Tool):
 
         chunks = await context.rag_service.retrieve(
             question=arguments.query,
+            user_id=context.user_id,
             top_k=arguments.top_k,
             document_ids=document_ids,
         )
@@ -88,12 +96,18 @@ class DocumentMetadataTool(Tool):
         if context.document_service is None or context.session is None:
             raise ToolError("document metadata is not available")
 
+        if not context.user_id:
+            raise ToolError("document metadata requires an authenticated user")
+
         document_id = parse_uuid(arguments.document_id)
 
         try:
+            # Scoped lookup: a document owned by somebody else is reported as
+            # simply not found, exactly like the HTTP API does.
             document = await context.document_service.get_document(
                 context.session,
                 document_id,
+                user_id=uuid.UUID(context.user_id),
             )
         except DocumentNotFoundError as exc:
             raise ToolError(f"document {document_id} was not found") from exc

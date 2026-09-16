@@ -21,16 +21,22 @@ from backend import dependencies as deps
 from backend.agent.graph import AgentService
 from backend.agent.tools.registry import ToolRegistry, default_registry
 from backend.app import create_app
-from backend.config import Settings
+from backend.config import Settings, get_settings
 from backend.db import Base, get_db
 from backend.errors import InferenceUnavailableError
+from backend.models import ROLE_ADMIN, ROLE_USER, User
+from backend.security.passwords import hash_password
+from backend.security.tokens import create_access_token
+from backend.services.auth_service import AuthService
 from backend.services.conversation_service import ConversationService
 from backend.services.document_processor import DocumentProcessor
 from backend.services.document_service import DocumentService
 from backend.services.rag_service import RagService
+from backend.services.rate_limiter import RateLimiter
 from backend.services.storage import DocumentStorage
 
 VECTOR_SIZE = 8
+DEFAULT_PASSWORD = "correct-horse-battery-staple"
 
 
 # ---------------------------------------------------------------------------
@@ -103,9 +109,15 @@ class FakeVectorStore:
 
     async def upsert_chunks(self, records: list[dict[str, Any]]) -> None:
         for record in records:
+            if not record.get("user_id"):
+                raise ValueError("refusing to index a chunk without a user_id")
             self.points[record["point_id"]] = dict(record)
 
-    async def delete_document(self, document_id: str) -> None:
+    async def delete_document(
+        self,
+        document_id: str,
+        user_id: str | None = None,
+    ) -> None:
         if self.fail_on_delete:
             raise RuntimeError("qdrant is down")
 
@@ -113,6 +125,7 @@ class FakeVectorStore:
             key
             for key, value in self.points.items()
             if value["document_id"] == document_id
+            and (user_id is None or str(value.get("user_id")) == str(user_id))
         ]:
             del self.points[point_id]
 
@@ -120,14 +133,22 @@ class FakeVectorStore:
         self,
         vector: list[float],
         limit: int,
+        user_id: str,
         document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        self.searches.append({"limit": limit, "document_ids": document_ids})
+        """Mirrors the real store: the tenant filter is applied before limiting."""
+        if not user_id:
+            raise ValueError("search requires a user_id")
+
+        self.searches.append(
+            {"limit": limit, "user_id": user_id, "document_ids": document_ids}
+        )
 
         matches = [
             point
             for point in self.points.values()
-            if document_ids is None or point["document_id"] in document_ids
+            if str(point.get("user_id")) == str(user_id)
+            and (document_ids is None or point["document_id"] in document_ids)
         ]
         matches.sort(key=lambda point: (point["document_id"], point["chunk_index"]))
 
@@ -139,6 +160,7 @@ class FakeVectorStore:
                 {
                     "score": score,
                     "vector_score": score,
+                    "user_id": point.get("user_id"),
                     "document_id": point["document_id"],
                     "filename": point["filename"],
                     "page": point["page"],
@@ -185,13 +207,42 @@ class FakeInferenceClient:
 
 
 class FakeRedis:
+    """In-memory stand-in that also serves the rate limiter's Lua script."""
+
     def __init__(self) -> None:
         self.available = True
+        self.counters: dict[str, int] = {}
+        self.expiries: dict[str, int] = {}
 
     async def ping(self) -> bool:
         if not self.available:
             raise ConnectionError("redis is down")
         return True
+
+    async def eval(self, script: str, numkeys: int, *args):
+        """Mimic the INCR + EXPIRE script atomically enough for tests."""
+        if not self.available:
+            raise ConnectionError("redis is down")
+
+        key = args[0]
+        ttl = int(args[numkeys]) if len(args) > numkeys else 60
+
+        self.counters[key] = self.counters.get(key, 0) + 1
+
+        if self.counters[key] == 1:
+            self.expiries[key] = ttl
+
+        return self.counters[key]
+
+    async def delete(self, key: str) -> int:
+        self.counters.pop(key, None)
+        self.expiries.pop(key, None)
+        return 1
+
+    def expire_window(self) -> None:
+        """Simulate every TTL elapsing, without waiting for wall-clock time."""
+        self.counters.clear()
+        self.expiries.clear()
 
     async def aclose(self) -> None:
         return None
@@ -237,6 +288,9 @@ class FakeBroker:
 @pytest.fixture
 def settings(tmp_path) -> Settings:
     return Settings(
+        app_env="test",
+        # Deterministic and long enough to pass the strength check.
+        jwt_secret_key="test-secret-key-that-is-long-enough-for-the-policy",
         database_url="sqlite+aiosqlite:///:memory:",
         inference_api_key="test-key",
         embedding_dim=VECTOR_SIZE,
@@ -297,6 +351,20 @@ def inference() -> FakeInferenceClient:
 @pytest.fixture
 def redis_client() -> FakeRedis:
     return FakeRedis()
+
+
+@pytest.fixture
+def auth_service(settings) -> AuthService:
+    return AuthService(settings=settings)
+
+
+@pytest.fixture
+def rate_limiter(redis_client, settings) -> RateLimiter:
+    return RateLimiter(
+        redis=redis_client,
+        window_seconds=settings.rate_limit_window_seconds,
+        enabled=settings.rate_limit_enabled,
+    )
 
 
 @pytest.fixture
@@ -393,6 +461,8 @@ def app(
     conversation_service,
     task_dispatcher,
     broker,
+    auth_service,
+    rate_limiter,
 ):
     application = create_app(settings=settings)
 
@@ -420,17 +490,115 @@ def app(
     )
     application.dependency_overrides[deps.get_task_dispatcher] = lambda: task_dispatcher
     application.dependency_overrides[deps.get_broker] = lambda: broker
+    application.dependency_overrides[deps.get_auth_service] = lambda: auth_service
+    application.dependency_overrides[deps.get_rate_limiter] = lambda: rate_limiter
+    application.dependency_overrides[get_settings] = lambda: settings
 
     return application
 
 
 @pytest_asyncio.fixture
-async def client(app):
-    # ASGITransport does not run the lifespan, so no real resources are built.
+async def anonymous_client(app):
+    """A client with no Authorization header."""
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client
+
+
+# ---------------------------------------------------------------------------
+# Users and authenticated clients
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def make_user(session_factory, settings):
+    """Factory creating an active user straight in the database."""
+
+    async def _make(
+        email: str = "user@example.com",
+        password: str = DEFAULT_PASSWORD,
+        role: str = ROLE_USER,
+        is_active: bool = True,
+    ) -> User:
+        async with session_factory() as session:
+            user = User(
+                email=email.lower(),
+                password_hash=hash_password(password),
+                role=role,
+                is_active=is_active,
+            )
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+            return user
+
+    return _make
+
+
+@pytest.fixture
+def token_for(settings):
+    def _token(user: User) -> str:
+        token, _expires = create_access_token(settings, user.id, user.role)
+        return token
+
+    return _token
+
+
+@pytest.fixture
+def make_client(app, token_for):
+    """Build an httpx client that authenticates as a given user."""
+
+    def _make(user: User | None) -> AsyncClient:
+        headers = {}
+
+        if user is not None:
+            headers["Authorization"] = f"Bearer {token_for(user)}"
+
+        return AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers=headers,
+        )
+
+    return _make
+
+
+@pytest_asyncio.fixture
+async def user(make_user) -> User:
+    return await make_user(email="alice@example.com")
+
+
+@pytest_asyncio.fixture
+async def other_user(make_user) -> User:
+    return await make_user(email="bob@example.com")
+
+
+@pytest_asyncio.fixture
+async def admin_user(make_user) -> User:
+    return await make_user(email="admin@example.com", role=ROLE_ADMIN)
+
+
+@pytest_asyncio.fixture
+async def client(make_client, user):
+    """The default client: authenticated as ``user``.
+
+    Existing tests keep working unchanged; they simply run as a real tenant now.
+    """
+    async with make_client(user) as authed:
+        yield authed
+
+
+@pytest_asyncio.fixture
+async def other_client(make_client, other_user):
+    async with make_client(other_user) as authed:
+        yield authed
+
+
+@pytest_asyncio.fixture
+async def admin_client(make_client, admin_user):
+    async with make_client(admin_user) as authed:
+        yield authed
 
 
 # ---------------------------------------------------------------------------
@@ -439,58 +607,74 @@ async def client(app):
 
 
 @pytest_asyncio.fixture
-async def seeded_document(session_factory, vector_store):
-    """A ready Document with three indexed chunks, in DB and in the vector store."""
+async def make_document(session_factory, vector_store):
+    """Factory for a ready, indexed Document owned by a given user."""
     from backend.models import Document, DocumentChunk
 
-    document_id = uuid.uuid4()
-    texts = [
-        "Проект Атлас описывает миграцию биллинга",
-        "Проект Борей отвечает за складскую логистику",
-        "Финансовый отчёт за третий квартал",
-    ]
+    async def _make(
+        owner: User,
+        filename: str = "projects.pdf",
+        texts: list[str] | None = None,
+    ) -> uuid.UUID:
+        document_id = uuid.uuid4()
+        bodies = texts or [
+            "Проект Атлас описывает миграцию биллинга",
+            "Проект Борей отвечает за складскую логистику",
+            "Финансовый отчёт за третий квартал",
+        ]
 
-    async with session_factory() as session:
-        document = Document(
-            id=document_id,
-            filename="projects.pdf",
-            original_filename="projects.pdf",
-            content_type="application/pdf",
-            size_bytes=1024,
-            status="ready",
-            total_pages=1,
-            extracted_pages=1,
-            chunks_count=len(texts),
-        )
-        session.add(document)
-
-        records = []
-
-        for index, text in enumerate(texts):
-            point_id = str(uuid.uuid4())
+        async with session_factory() as session:
             session.add(
-                DocumentChunk(
-                    document_id=document_id,
-                    qdrant_point_id=point_id,
-                    page=1,
-                    chunk_index=index,
-                    text=text,
+                Document(
+                    id=document_id,
+                    user_id=owner.id,
+                    filename=filename,
+                    original_filename=filename,
+                    content_type="application/pdf",
+                    size_bytes=1024,
+                    status="ready",
+                    total_pages=1,
+                    extracted_pages=1,
+                    chunks_count=len(bodies),
                 )
             )
-            records.append(
-                {
-                    "point_id": point_id,
-                    "vector": _deterministic_vector(text),
-                    "document_id": str(document_id),
-                    "filename": "projects.pdf",
-                    "page": 1,
-                    "chunk_index": index,
-                    "text": text,
-                }
-            )
 
-        await session.commit()
+            records = []
 
-    await vector_store.upsert_chunks(records)
+            for index, text in enumerate(bodies):
+                point_id = str(uuid.uuid4())
+                session.add(
+                    DocumentChunk(
+                        document_id=document_id,
+                        qdrant_point_id=point_id,
+                        page=1,
+                        chunk_index=index,
+                        text=text,
+                    )
+                )
+                records.append(
+                    {
+                        "point_id": point_id,
+                        "vector": _deterministic_vector(text),
+                        "user_id": str(owner.id),
+                        "document_id": str(document_id),
+                        "filename": filename,
+                        "page": 1,
+                        "chunk_index": index,
+                        "text": text,
+                    }
+                )
 
-    return document_id
+            await session.commit()
+
+        await vector_store.upsert_chunks(records)
+
+        return document_id
+
+    return _make
+
+
+@pytest_asyncio.fixture
+async def seeded_document(make_document, user) -> uuid.UUID:
+    """A ready Document owned by the default ``user`` fixture."""
+    return await make_document(user)

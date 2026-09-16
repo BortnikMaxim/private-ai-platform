@@ -26,6 +26,9 @@ class ToolResult(TypedDict, total=False):
 class AgentState(TypedDict, total=False):
     # -- input ------------------------------------------------------------
     conversation_id: str
+    # The authenticated tenant. Set by AgentService.run from the request
+    # principal; nothing in the graph may override it.
+    user_id: str
     user_message: str
     chat_history: list[dict[str, str]]
     use_rag: bool
@@ -49,6 +52,7 @@ class AgentState(TypedDict, total=False):
 
 def initial_state(
     conversation_id: str,
+    user_id: str,
     user_message: str,
     chat_history: list[dict[str, str]] | None = None,
     use_rag: bool = False,
@@ -56,6 +60,7 @@ def initial_state(
 ) -> AgentState:
     return AgentState(
         conversation_id=conversation_id,
+        user_id=user_id,
         user_message=user_message,
         chat_history=list(chat_history or []),
         use_rag=use_rag,

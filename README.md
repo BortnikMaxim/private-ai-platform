@@ -21,17 +21,22 @@ served by a local Gemma model through MLX on Apple Silicon.
 flowchart TD
     Client[Client / curl / UI]
 
-    Client -->|HTTP :8000| Backend[Backend FastAPI]
+    Client -->|POST /auth/login| Auth[Auth: Argon2id + JWT]
+    Auth -->|Bearer token| Client
+    Client -->|HTTP :8000 + Bearer| Backend[Backend FastAPI]
+    Backend --> Principal{{current_user<br/>id + role}}
+    Principal --> Backend
 
     Backend --> Postgres[(PostgreSQL 16<br/>users, conversations,<br/>messages, documents, chunks)]
     Backend --> Redis[(Redis<br/>cache, Celery results)]
-    Backend --> Qdrant[(Qdrant<br/>vector collection 'documents')]
+    Backend -->|filter user_id| Qdrant[(Qdrant<br/>vector collection 'documents')]
     Backend -->|X-API-Key, :8001| Inference[Inference API FastAPI]
     Backend -->|enqueue document_id| Rabbit[(RabbitMQ<br/>queue 'documents')]
     Backend -->|write PDF| Files[/data/uploads/]
 
     Rabbit -->|consume| Worker[Celery worker]
     Worker -->|read PDF| Files
+    Worker -->|tag chunks with owner| Qdrant
     Worker --> Postgres
     Worker --> Qdrant
     Worker --> Redis
@@ -118,8 +123,11 @@ backend/
   dependencies.py        DI providers backed by app.state
   errors.py              domain errors mapped to HTTP status codes
   prompts/               system prompts (__init__.py, agent.py)
-  observability.py       Prometheus metrics + stage/agent logging
-  api/                   health.py, documents.py, conversations.py, rag.py
+  observability.py       Prometheus metrics + stage/agent/auth logging
+  api/                   health, auth, admin, documents, conversations, rag
+  security/
+    passwords.py           Argon2id hashing and the length policy
+    tokens.py              JWT issuing and verification (PyJWT)
   agent/
     graph.py               LangGraph state machine + AgentService
     state.py               typed, JSON-serialisable AgentState
@@ -142,6 +150,8 @@ backend/
     document_processor.py  the heavy pipeline the worker runs
     conversation_service.py chat turn orchestration
     inference_client.py    pooled httpx client for the inference service
+    auth_service.py        register / authenticate / user lookup
+    rate_limiter.py        Redis fixed-window limiter (atomic Lua)
     task_queue.py          TaskDispatcher protocol (no Celery import)
     broker.py              RabbitMQ / Celery liveness probes
   worker/
@@ -174,17 +184,23 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt   # tests and linting
 
 cp .env.example .env
-# then edit .env — at minimum set INFERENCE_API_KEY
+# then edit .env — at minimum set INFERENCE_API_KEY and JWT_SECRET_KEY
 ```
 
-Generate an API key:
+Generate the two secrets:
 
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+python -c "import secrets; print('INFERENCE_API_KEY=' + secrets.token_urlsafe(32))"
+python -c "import secrets; print('JWT_SECRET_KEY=' + secrets.token_urlsafe(48))"
 ```
 
-The same value must be given to both services: `INFERENCE_API_KEY` in `.env`
-(read by the backend) and in the environment of the inference service.
+`INFERENCE_API_KEY` must match on both sides: in `.env` (read by the backend)
+and in the environment of the inference service.
+
+`JWT_SECRET_KEY` signs access tokens. There is no fallback default on purpose:
+with `APP_ENV=production` the backend refuses to start without a strong one,
+and on a developer machine an unset key is replaced by a random per-process
+value — which works, but invalidates every issued token on restart.
 
 ## 1. Start the infrastructure
 
@@ -219,6 +235,33 @@ no database URL committed in `alembic.ini`. To target another database ad hoc:
 
 ```bash
 alembic -x db_url=postgresql+asyncpg://user:pass@host:5432/db upgrade head
+```
+
+### Upgrading a database that predates authentication (0003)
+
+Migration `0003_auth` makes `conversations.user_id` and `documents.user_id`
+NOT NULL. Rows created before authentication existed have no owner, so instead
+of deleting them the migration **adopts** them: it inserts one locked account,
+`system@local.invalid` (`is_active = false`, and a password hash that is not a
+valid Argon2 digest, so nothing can ever authenticate as it), assigns the
+orphans to it, and only then tightens the columns.
+
+Nothing is lost and nothing is reachable by a real user. Reassign the rows to
+yourself once you have registered:
+
+```sql
+UPDATE conversations SET user_id = '<your-user-id>'
+ WHERE user_id = (SELECT id FROM users WHERE email = 'system@local.invalid');
+UPDATE documents SET user_id = '<your-user-id>'
+ WHERE user_id = (SELECT id FROM users WHERE email = 'system@local.invalid');
+```
+
+Vectors indexed before this release have no `user_id` payload, so every
+tenant-scoped query filters them out — invisible rather than leaked. Repair
+them in place instead of re-uploading:
+
+```bash
+python -m backend.scripts.reset_qdrant --backfill-user-ids --yes
 ```
 
 ### Upgrading a database that predates Alembic
@@ -479,6 +522,158 @@ curl -s -X POST http://127.0.0.1:8000/rag/retrieve \
 
 ---
 
+## Authentication & Multi-Tenancy
+
+Every endpoint except `/health`, `/health/workers`, `/metrics` and the two
+`/auth` entry points requires `Authorization: Bearer <token>`. Each user sees
+only their own conversations and documents, and retrieval is filtered inside
+Qdrant by owner.
+
+```mermaid
+flowchart LR
+    C[Client] -->|register / login| A[/auth/]
+    A -->|JWT: sub, role, exp| C
+    C -->|Bearer token| D{current_user}
+    D --> CV[Conversations]
+    D --> DOC[Documents]
+    D --> AG[Agent / RAG]
+    CV --> PG[(PostgreSQL<br/>WHERE user_id = me)]
+    DOC --> PG
+    AG --> QF[Qdrant filter<br/>user_id == me]
+    QF --> QD[(Qdrant)]
+```
+
+### Tokens
+
+Passwords are hashed with **Argon2id** (`argon2-cffi`, per-hash salt and
+parameters embedded in the digest). Access tokens are **JWT HS256** issued and
+verified by PyJWT — no hand-rolled crypto, and the verifier pins the algorithm
+so an `alg: none` token cannot get through.
+
+The payload is deliberately thin: `sub` (user id), `role`, `iat`, `exp`, `iss`.
+No email, no name — a leaked token should say as little as possible about its
+owner. There are no refresh tokens yet; the access token expires after
+`JWT_ACCESS_TOKEN_EXPIRE_MINUTES` and the client logs in again.
+
+### Ownership
+
+`Conversation.user_id` and `Document.user_id` are **NOT NULL** foreign keys.
+`Message` inherits its tenant through the conversation, `DocumentChunk` through
+the document. Ownership always comes from the token — `POST /conversations` has
+no `user_id` field, and `POST /documents` takes the owner from the principal.
+
+A resource belonging to somebody else answers **404, not 403**, so the API never
+confirms that a foreign UUID exists.
+
+| Situation | Status |
+| --- | --- |
+| no / malformed / expired token | `401` |
+| deactivated account, or a non-admin on `/admin` | `403` |
+| foreign or nonexistent conversation or document | `404` |
+| duplicate registration | `409` |
+| password below the policy | `422` |
+| rate limited | `429` (with `Retry-After`) |
+
+### Qdrant tenant isolation
+
+Every point carries `user_id` in its payload, and every search sends a
+server-side filter:
+
+```
+must: [ user_id == <caller>, (optional) document_id IN [...] ]
+```
+
+`VectorStore.search()` takes `user_id` as a required argument, so it cannot be
+called unscoped, and `upsert_chunks()` refuses a record without one — an
+untagged point would be invisible to every query anyway. `document_ids` from a
+request body only ever *narrows* the search; naming a foreign document returns
+nothing rather than that document.
+
+Filtering happens inside Qdrant, not in Python afterwards. That is not a
+performance detail: with a post-filter, a query whose nearest neighbour belongs
+to another tenant would come back short — or empty at `limit=1` — and the
+foreign chunk would already have been read. `tests/test_tenant_integration.py`
+proves the difference against a live Qdrant.
+
+The Celery worker reads the owner from the `documents` row, never from the task
+message, so a forged or replayed task cannot index chunks under the wrong
+tenant, and a retry keeps the original owner.
+
+### Rate limiting
+
+A fixed window in Redis: `INCR` plus a first-hit `EXPIRE`, both inside one Lua
+script so a counter can never be left without a TTL. Keys hold a number and
+nothing else — authenticated callers are keyed by user id, anonymous ones by a
+SHA-256 prefix of their address, so no email or address is ever stored.
+
+| Route | Setting |
+| --- | --- |
+| `/auth/login`, `/auth/register` | `RATE_LIMIT_AUTH_PER_MINUTE` (per client address) |
+| `POST /conversations/{id}/messages`, `/agent` | `RATE_LIMIT_CHAT_PER_MINUTE` (per user) |
+| `POST /documents` | `RATE_LIMIT_UPLOAD_PER_MINUTE` (per user) |
+
+Login is limited per address rather than per submitted email: keying on the
+email would let anyone lock a victim out of their own account. If Redis is
+unreachable the limiter logs and allows the request — availability wins over
+throttling for a self-hosted deployment.
+
+### Admin
+
+`GET /admin/users` and `PATCH /admin/users/{id}/active` require `role=admin`.
+Admin is a *separate surface*, not a master key: an admin calling
+`GET /documents` still sees only their own documents. Anything cross-tenant has
+to be an explicit `/admin` call, so a bug in a user route cannot quietly become
+a tenant bypass. Registration always creates a plain user.
+
+Create the first administrator (the password is read from a prompt, never from
+the argument list):
+
+```bash
+python -m backend.scripts.create_admin --email admin@example.com
+```
+
+### Walkthrough
+
+```bash
+BASE=http://127.0.0.1:8000
+
+# 1. register
+curl -s -X POST $BASE/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alice@example.com", "password": "a-sufficiently-long-password"}' | jq
+
+# 2. log in
+TOKEN=$(curl -s -X POST $BASE/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alice@example.com", "password": "a-sufficiently-long-password"}' \
+  | jq -r .access_token)
+
+curl -s $BASE/auth/me -H "Authorization: Bearer $TOKEN" | jq
+
+# 3. upload a document (owned by Alice)
+DOC=$(curl -s -X POST $BASE/documents \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@/path/to/report.pdf" | jq -r .document_id)
+
+until [ "$(curl -s $BASE/documents/$DOC -H "Authorization: Bearer $TOKEN" | jq -r .status)" != "processing" ]; do
+  sleep 2
+done
+
+# 4. a conversation, then an agent turn over Alice's own documents
+CONV=$(curl -s -X POST $BASE/conversations \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"title": "Отчёты"}' | jq -r .id)
+
+curl -s -X POST $BASE/conversations/$CONV/agent \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"content": "Какие проекты описаны?", "use_rag": true}' | jq
+```
+
+Swagger UI at <http://127.0.0.1:8000/docs> has an **Authorize** button: paste
+the token and every protected route becomes callable from the browser.
+
+---
+
 ## Agent Architecture
 
 `POST /conversations/{id}/agent` answers a turn through a LangGraph state
@@ -670,6 +865,17 @@ All settings come from environment variables (or `.env`); see `.env.example`.
 | `CELERY_TASK_SOFT_TIME_LIMIT` / `CELERY_TASK_TIME_LIMIT` | `1500` / `1800` | per-task limits |
 | `WORKER_METRICS_PORT` | `0` | worker Prometheus port; `0` disables it |
 | `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | dev defaults | consumed by docker-compose |
+| `APP_ENV` | `dev` | `production` enables strict startup checks |
+| `JWT_SECRET_KEY` | *(none)* | token signing key; required in production |
+| `JWT_ALGORITHM` | `HS256` | pinned during verification |
+| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | `60` | access token lifetime |
+| `PASSWORD_MIN_LENGTH` / `PASSWORD_MAX_LENGTH` | `10` / `128` | password policy |
+| `CORS_ALLOWED_ORIGINS` | *(empty)* | comma separated origins; never `*` |
+| `RATE_LIMIT_ENABLED` | `true` | master switch |
+| `RATE_LIMIT_AUTH_PER_MINUTE` | `10` | login and register, per client address |
+| `RATE_LIMIT_CHAT_PER_MINUTE` | `30` | messages and agent turns, per user |
+| `RATE_LIMIT_UPLOAD_PER_MINUTE` | `10` | document uploads, per user |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | window length |
 | `LOG_LEVEL` | `INFO` | logging level |
 
 `.env` is git-ignored, and so is `data/`. The API key, prompt bodies and
@@ -849,6 +1055,20 @@ alembic upgrade head
   used. `websockets` is pinned to `16.1.1` because `langgraph-sdk` requires
   `<17`; the project has no WebSocket routes, so nothing depends on the newer
   release.
+- **No refresh tokens and no revocation list.** An access token stays valid
+  until it expires. Deactivating a user takes effect immediately because every
+  request re-reads the row, but a stolen token cannot be individually revoked
+  before `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` elapses.
+- **Rate limiting is a fixed window, not a sliding one.** A caller can send two
+  full budgets across a window boundary. Good enough to blunt brute force;
+  not a traffic shaper.
+- **The limiter fails open.** If Redis is down, requests are allowed rather
+  than rejected. Deliberate for a self-hosted single-user deployment; flip it
+  for a shared one.
+- **Ownership is per user, not per organisation.** There are no teams, shared
+  documents or per-document ACLs — one user is one tenant.
+- **Rows adopted by migration 0003** belong to the locked
+  `system@local.invalid` account until you reassign them (see above).
 - **No agent tracing UI.** LangSmith is installed transitively but not
   configured, and no checkpointer is attached — the graph is stateless between
   turns and memory comes from the `messages` table.

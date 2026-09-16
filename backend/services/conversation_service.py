@@ -47,7 +47,7 @@ class ConversationService:
         self,
         session: AsyncSession,
         title: str,
-        user_id: uuid.UUID | None = None,
+        user_id: uuid.UUID,
     ) -> Conversation:
         conversation = Conversation(title=title, user_id=user_id)
 
@@ -60,13 +60,23 @@ class ConversationService:
     async def list_conversations(
         self,
         session: AsyncSession,
+        user_id: uuid.UUID,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[Conversation], int]:
-        total = await session.scalar(select(func.count()).select_from(Conversation)) or 0
+        """Only the caller's own conversations; there is no unscoped listing."""
+        total = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Conversation)
+                .where(Conversation.user_id == user_id)
+            )
+            or 0
+        )
 
         result = await session.execute(
             select(Conversation)
+            .where(Conversation.user_id == user_id)
             .order_by(Conversation.updated_at.desc())
             .limit(limit)
             .offset(offset)
@@ -78,10 +88,20 @@ class ConversationService:
         self,
         session: AsyncSession,
         conversation_id: uuid.UUID,
+        user_id: uuid.UUID,
     ) -> Conversation:
+        """Fetch one conversation belonging to ``user_id``.
+
+        Somebody else\'s conversation raises the same
+        :class:`ConversationNotFoundError` as a nonexistent one, so the API
+        never confirms that a foreign UUID exists.
+        """
         conversation = (
             await session.execute(
-                select(Conversation).where(Conversation.id == conversation_id)
+                select(Conversation).where(
+                    Conversation.id == conversation_id,
+                    Conversation.user_id == user_id,
+                )
             )
         ).scalar_one_or_none()
 
@@ -94,8 +114,9 @@ class ConversationService:
         self,
         session: AsyncSession,
         conversation_id: uuid.UUID,
+        user_id: uuid.UUID,
     ) -> None:
-        conversation = await self.get(session, conversation_id)
+        conversation = await self.get(session, conversation_id, user_id)
 
         await session.delete(conversation)
         await session.commit()
@@ -129,15 +150,16 @@ class ConversationService:
         session: AsyncSession,
         conversation_id: uuid.UUID,
         content: str,
+        user_id: uuid.UUID,
         use_rag: bool = False,
         document_ids: list[uuid.UUID] | None = None,
         top_k: int | None = None,
         candidate_k: int | None = None,
     ) -> tuple[Message, list[dict[str, Any]]]:
-        conversation = await self.get(session, conversation_id)
+        conversation = await self.get(session, conversation_id, user_id)
 
         if document_ids:
-            await self._assert_documents_exist(session, document_ids)
+            await self._assert_documents_exist(session, document_ids, user_id)
 
         # 1. persist the user turn so history survives a restart even if the
         #    model call fails afterwards.
@@ -163,6 +185,7 @@ class ConversationService:
         if use_rag:
             sources = await self.rag.retrieve(
                 question=content,
+                user_id=str(user_id),
                 top_k=top_k,
                 candidate_k=candidate_k,
                 document_ids=[str(value) for value in document_ids or []] or None,
@@ -205,6 +228,7 @@ class ConversationService:
         session: AsyncSession,
         conversation_id: uuid.UUID,
         content: str,
+        user_id: uuid.UUID,
         use_rag: bool = True,
         document_ids: list[uuid.UUID] | None = None,
     ) -> tuple[Message, dict[str, Any]]:
@@ -217,10 +241,10 @@ class ConversationService:
         if self.agent is None:
             raise AgentUnavailableError()
 
-        conversation = await self.get(session, conversation_id)
+        conversation = await self.get(session, conversation_id, user_id)
 
         if document_ids:
-            await self._assert_documents_exist(session, document_ids)
+            await self._assert_documents_exist(session, document_ids, user_id)
 
         user_message = Message(
             conversation_id=conversation.id,
@@ -238,6 +262,7 @@ class ConversationService:
 
         state = await self.agent.run(
             conversation_id=conversation_id,
+            user_id=str(user_id),
             user_message=content,
             chat_history=[
                 {"role": message.role, "content": message.content}
@@ -294,8 +319,14 @@ class ConversationService:
         self,
         session: AsyncSession,
         document_ids: list[uuid.UUID],
+        user_id: uuid.UUID,
     ) -> None:
-        found = set(await self.documents.existing_document_ids(session, document_ids))
+        """A document the caller does not own is reported as simply unknown."""
+        found = set(
+            await self.documents.existing_document_ids(
+                session, document_ids, user_id=user_id
+            )
+        )
         missing = [str(value) for value in document_ids if value not in found]
 
         if missing:

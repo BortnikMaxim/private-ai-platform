@@ -53,6 +53,16 @@ class FakeQdrantClient:
     async def create_payload_index(self, **_kwargs) -> None:
         return None
 
+    async def set_payload(self, collection_name, payload, points, wait=True):
+        matched = {
+            value
+            for condition in points.must
+            for value in getattr(condition.match, "any", [])
+        }
+        for point in self.points:
+            if point.payload.get("document_id") in matched:
+                point.payload.update(payload)
+
     async def close(self) -> None:
         self.closed = True
 
@@ -72,7 +82,13 @@ def fake_client(monkeypatch):
 
 def args(**overrides) -> argparse.Namespace:
     return argparse.Namespace(
-        **{"purge_orphans": False, "recreate": False, "yes": False, **overrides}
+        **{
+            "purge_orphans": False,
+            "recreate": False,
+            "backfill_user_ids": False,
+            "yes": False,
+            **overrides,
+        }
     )
 
 

@@ -59,7 +59,42 @@ AGENT_TOOL_CALLS_TOTAL = Counter(
     ["tool", "status"],
 )
 
+# --- auth ------------------------------------------------------------------
+
+AUTH_LOGINS_TOTAL = Counter(
+    "auth_logins_total",
+    "Login attempts by outcome",
+    ["status"],
+)
+
+AUTH_REGISTRATIONS_TOTAL = Counter(
+    "auth_registrations_total",
+    "Registration attempts by outcome",
+    ["status"],
+)
+
+RATE_LIMIT_REJECTIONS_TOTAL = Counter(
+    "rate_limit_rejections_total",
+    "Requests rejected by the rate limiter",
+    ["route"],
+)
+
 agent_logger = logging.getLogger("backend.agent")
+auth_logger = logging.getLogger("backend.auth")
+
+
+def auth_event(event: str, **fields: object) -> None:
+    """Structured auth log line.
+
+    Only identifiers and outcomes. Passwords, tokens, password hashes, the
+    Authorization header and full email addresses are never arguments here —
+    the caller passes a user id, and unauthenticated events pass nothing that
+    identifies a person.
+    """
+    details = " ".join(
+        f"{key}={value}" for key, value in sorted(fields.items()) if value is not None
+    )
+    auth_logger.info("%s%s", event, f" {details}" if details else "")
 
 
 def agent_event(event: str, conversation_id: str, **fields: object) -> None:

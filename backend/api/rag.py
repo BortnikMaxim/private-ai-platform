@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException
 
-from backend.dependencies import InferenceDep, RagDep
+from backend.dependencies import CurrentUser, InferenceDep, RagDep
 from backend.prompts import GROUNDED_SYSTEM_PROMPT
 from backend.schemas import (
     AskRequest,
@@ -21,11 +21,15 @@ async def ask(
     payload: AskRequest,
     rag: RagDep,
     inference: InferenceDep,
+    user: CurrentUser,
 ) -> AskResponse:
+    # document_ids narrows the search; the tenant filter still applies on top,
+    # so a foreign id in the body simply matches nothing.
     document_ids = [str(value) for value in payload.document_ids or []] or None
 
     retrieved = await rag.retrieve(
         question=payload.question,
+        user_id=str(user.id),
         top_k=payload.top_k,
         candidate_k=payload.candidate_k,
         document_ids=document_ids,
@@ -60,12 +64,14 @@ async def ask(
 async def retrieve(
     payload: RetrieveRequest,
     rag: RagDep,
+    user: CurrentUser,
 ) -> RetrieveResponse:
     """Debug endpoint: inspect vector hits and reranked results side by side."""
     document_ids = [str(value) for value in payload.document_ids or []] or None
 
     vector_results = await rag.vector_retrieve(
         question=payload.question,
+        user_id=str(user.id),
         limit=payload.candidate_k,
         document_ids=document_ids,
     )

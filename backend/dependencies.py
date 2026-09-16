@@ -9,19 +9,29 @@ lightweight fakes through ``app.dependency_overrides``.
 from typing import Annotated
 
 from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from backend.config import Settings, get_settings
 from backend.db import get_db
+from backend.errors import InactiveUserError, InvalidTokenError, PermissionDeniedError
+from backend.models import ROLE_ADMIN, User
+from backend.security.tokens import decode_access_token
+from backend.services.auth_service import AuthService
 from backend.services.broker import BrokerClient
 from backend.services.conversation_service import ConversationService
 from backend.services.document_processor import DocumentProcessor
 from backend.services.document_service import DocumentService
 from backend.services.inference_client import InferenceClient
 from backend.services.rag_service import RagService
+from backend.services.rate_limiter import RateLimiter
 from backend.services.task_queue import TaskDispatcher
 from backend.services.vector_store import VectorStore
+
+# auto_error=False so a missing header raises our own 401 with the standard
+# WWW-Authenticate treatment instead of FastAPI's 403.
+bearer_scheme = HTTPBearer(auto_error=False, description="JWT access token")
 
 
 def get_engine(request: Request) -> AsyncEngine:
@@ -68,6 +78,67 @@ def get_session_factory(request: Request) -> async_sessionmaker:
     return request.app.state.session_factory
 
 
+def get_auth_service(request: Request) -> AuthService:
+    return request.app.state.auth_service
+
+
+def get_rate_limiter(request: Request) -> RateLimiter:
+    return request.app.state.rate_limiter
+
+
+def get_agent_service(request: Request):
+    return request.app.state.agent_service
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+
+async def get_current_user(
+    session: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    auth: Annotated[AuthService, Depends(get_auth_service)],
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+    ] = None,
+) -> User:
+    """Resolve the bearer token to a user row.
+
+    Token parsing lives here and nowhere else, so no router ever touches a JWT.
+    """
+    if credentials is None or not credentials.credentials:
+        raise InvalidTokenError("Not authenticated")
+
+    claims = decode_access_token(settings, credentials.credentials)
+    user = await auth.get_by_id(session, claims.user_id)
+
+    if user is None:
+        # The signature was valid but the account is gone. Same 401 as a bad
+        # token: a deleted account must not be distinguishable.
+        raise InvalidTokenError()
+
+    return user
+
+
+async def get_current_active_user(
+    user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    if not user.is_active:
+        raise InactiveUserError()
+
+    return user
+
+
+async def require_admin(
+    user: Annotated[User, Depends(get_current_active_user)],
+) -> User:
+    if user.role != ROLE_ADMIN:
+        raise PermissionDeniedError("Administrator privileges are required")
+
+    return user
+
+
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 EngineDep = Annotated[AsyncEngine, Depends(get_engine)]
@@ -83,3 +154,7 @@ DocumentProcessorDep = Annotated[DocumentProcessor, Depends(get_document_process
 TaskDispatcherDep = Annotated[TaskDispatcher, Depends(get_task_dispatcher)]
 BrokerDep = Annotated[BrokerClient, Depends(get_broker)]
 SessionFactoryDep = Annotated[async_sessionmaker, Depends(get_session_factory)]
+AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+RateLimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
+CurrentUser = Annotated[User, Depends(get_current_active_user)]
+AdminUser = Annotated[User, Depends(require_admin)]

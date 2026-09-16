@@ -54,7 +54,7 @@ def extractable(monkeypatch):
 
 
 @pytest.fixture
-async def queued_document(session_factory, storage, pdf_bytes):
+async def queued_document(session_factory, storage, pdf_bytes, user):
     """A processing Document whose source PDF is on disk, as after POST."""
     document_id = uuid.uuid4()
 
@@ -62,6 +62,7 @@ async def queued_document(session_factory, storage, pdf_bytes):
         session.add(
             Document(
                 id=document_id,
+                user_id=user.id,
                 filename="queued.pdf",
                 original_filename="queued.pdf",
                 content_type="application/pdf",
@@ -343,7 +344,7 @@ async def test_qdrant_outage_raises_a_transient_error_for_retry(
     queued_document,
     extractable,
 ):
-    async def explode(_document_id):
+    async def explode(_document_id, user_id=None):
         raise ConnectionError("qdrant is unreachable")
 
     vector_store.delete_document = explode
@@ -505,3 +506,70 @@ async def test_duration_is_labelled_with_the_real_outcome(
         await process_with(document_processor, session_factory, uuid.uuid4())
 
     assert _duration_count(expected_outcome) == before + 1
+
+
+# ---------------------------------------------------------------------------
+# Ownership
+# ---------------------------------------------------------------------------
+
+
+async def test_indexed_points_carry_the_owners_user_id(
+    document_processor,
+    session_factory,
+    vector_store,
+    queued_document,
+    extractable,
+    user,
+):
+    """The tenant tag comes from the document row, not from the task payload."""
+    await process_with(document_processor, session_factory, queued_document)
+
+    assert vector_store.points
+    for payload in vector_store.points.values():
+        assert payload["user_id"] == str(user.id)
+
+
+async def test_reprocessing_keeps_the_same_owner(
+    document_processor,
+    session_factory,
+    vector_store,
+    queued_document,
+    extractable,
+    user,
+):
+    await process_with(document_processor, session_factory, queued_document)
+
+    async with session_factory() as session:
+        document = await session.get(Document, queued_document)
+        document.status = "processing"
+        await session.commit()
+
+    await document_processor.storage.save(queued_document, b"%PDF-1.4 again")
+    await process_with(document_processor, session_factory, queued_document)
+
+    for payload in vector_store.points.values():
+        assert payload["user_id"] == str(user.id)
+
+
+async def test_the_task_payload_cannot_choose_the_tenant(
+    document_processor,
+    session_factory,
+    vector_store,
+    queued_document,
+    extractable,
+    other_user,
+    user,
+):
+    """A task carries only a document id; ownership is never client supplied."""
+    import inspect
+
+    from backend.worker.tasks import process_document_task
+
+    signature = inspect.signature(process_document_task.run)
+    assert list(signature.parameters) == ["document_id"]
+
+    await process_with(document_processor, session_factory, queued_document)
+
+    owners = {payload["user_id"] for payload in vector_store.points.values()}
+    assert owners == {str(user.id)}
+    assert str(other_user.id) not in owners

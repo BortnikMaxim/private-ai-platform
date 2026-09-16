@@ -243,7 +243,12 @@ async def test_unavailable_vector_store_on_delete_is_503(
 # ---------------------------------------------------------------------------
 
 
-async def test_unexpected_error_returns_500_without_a_traceback(app, vector_store):
+async def test_unexpected_error_returns_500_without_a_traceback(
+    app,
+    vector_store,
+    user,
+    token_for,
+):
     async def explode(*args, **kwargs):
         raise RuntimeError("simulated internal failure with secret details")
 
@@ -253,7 +258,11 @@ async def test_unexpected_error_returns_500_without_a_traceback(app, vector_stor
     # response is delivered to the client and the exception goes to the logs.
     transport = ASGITransport(app=app, raise_app_exceptions=False)
 
-    async with AsyncClient(transport=transport, base_url="http://test") as raw_client:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {token_for(user)}"},
+    ) as raw_client:
         response = await raw_client.post("/rag/retrieve", json={"question": "q"})
 
     assert_clean_error(response, 500)

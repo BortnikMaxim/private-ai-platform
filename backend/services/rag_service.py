@@ -25,14 +25,22 @@ class RagService:
     async def vector_retrieve(
         self,
         question: str,
+        user_id: str,
         limit: int | None = None,
         document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """Tenant-scoped vector search.
+
+        ``user_id`` has no default on purpose: every call site must supply it,
+        and it always comes from the authenticated principal, never from a
+        request body.
+        """
         vector = await self.embeddings.embed_query(question)
 
         return await self.vector_store.search(
             vector=vector,
             limit=limit or self.settings.rag_candidate_k,
+            user_id=user_id,
             document_ids=document_ids,
         )
 
@@ -51,13 +59,15 @@ class RagService:
     async def retrieve(
         self,
         question: str,
+        user_id: str,
         top_k: int | None = None,
         candidate_k: int | None = None,
         document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Full retrieval pipeline used by both /rag/ask and conversations."""
+        """Full retrieval pipeline used by /rag/ask, conversations and the agent."""
         candidates = await self.vector_retrieve(
             question=question,
+            user_id=user_id,
             limit=candidate_k or self.settings.rag_candidate_k,
             document_ids=document_ids,
         )

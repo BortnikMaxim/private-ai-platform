@@ -68,13 +68,23 @@ class DocumentService:
     async def list_documents(
         self,
         session: AsyncSession,
+        user_id: uuid.UUID,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[Document], int]:
-        total = await session.scalar(select(func.count()).select_from(Document)) or 0
+        """Only the caller's own documents; there is no unscoped listing."""
+        total = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Document)
+                .where(Document.user_id == user_id)
+            )
+            or 0
+        )
 
         result = await session.execute(
             select(Document)
+            .where(Document.user_id == user_id)
             .order_by(Document.created_at.desc())
             .limit(limit)
             .offset(offset)
@@ -86,9 +96,22 @@ class DocumentService:
         self,
         session: AsyncSession,
         document_id: uuid.UUID,
+        user_id: uuid.UUID | None = None,
         with_chunks: bool = False,
     ) -> Document:
+        """Fetch a document, optionally constrained to one owner.
+
+        A document owned by somebody else raises the same
+        :class:`DocumentNotFoundError` as one that does not exist, so the API
+        never confirms that a foreign UUID is real.
+
+        ``user_id=None`` is the unscoped form and exists only for the Celery
+        worker, which resolves ownership from the row itself.
+        """
         query = select(Document).where(Document.id == document_id)
+
+        if user_id is not None:
+            query = query.where(Document.user_id == user_id)
 
         if with_chunks:
             query = query.options(selectinload(Document.chunks))
@@ -104,12 +127,17 @@ class DocumentService:
         self,
         session: AsyncSession,
         document_ids: list[uuid.UUID],
+        user_id: uuid.UUID,
     ) -> list[uuid.UUID]:
+        """Which of these ids the caller actually owns."""
         if not document_ids:
             return []
 
         result = await session.execute(
-            select(Document.id).where(Document.id.in_(document_ids))
+            select(Document.id).where(
+                Document.id.in_(document_ids),
+                Document.user_id == user_id,
+            )
         )
         return list(result.scalars().all())
 
@@ -160,16 +188,21 @@ class DocumentService:
         self,
         session: AsyncSession,
         upload: UploadFile,
+        user_id: uuid.UUID,
     ) -> Document:
         """Validate and persist an upload, then record it as ``processing``.
 
         Everything here is cheap and bounded: the request never waits for
         parsing or embedding. The heavy work is picked up by a Celery worker.
+
+        ``user_id`` comes from the authenticated caller; the request body has no
+        say in who owns the result.
         """
         file_bytes = await self.read_upload(upload)
         original_filename = upload.filename or "document.pdf"
 
         document = Document(
+            user_id=user_id,
             filename=sanitize_filename(original_filename),
             original_filename=original_filename[:255],
             content_type=(upload.content_type or "application/pdf")[:127],
@@ -218,6 +251,7 @@ class DocumentService:
         self,
         session: AsyncSession,
         document_id: uuid.UUID,
+        user_id: uuid.UUID,
         dispatcher: "TaskDispatcher | None" = None,
     ) -> None:
         """Delete a document, whether or not a worker is still processing it.
@@ -228,7 +262,7 @@ class DocumentService:
         results for a row that is gone. Revoking the task is best effort on top
         of that — a worker that already dequeued the job ignores a revoke.
         """
-        document = await self.get_document(session, document_id)
+        document = await self.get_document(session, document_id, user_id=user_id)
         was_processing = document.status == "processing"
         task_id = document.celery_task_id
 
@@ -238,7 +272,10 @@ class DocumentService:
         # Remove the vectors first: orphaned rows are recoverable, orphaned
         # vectors would keep showing up in retrieval results.
         try:
-            await self.vector_store.delete_document(str(document.id))
+            await self.vector_store.delete_document(
+                str(document.id),
+                user_id=str(document.user_id),
+            )
         except Exception as exc:
             logger.exception("vector_delete_failed document_id=%s", document_id)
             raise VectorStoreError(

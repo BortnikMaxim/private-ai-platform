@@ -3,7 +3,13 @@ import uuid
 from fastapi import APIRouter, Query, status
 
 from backend.agent.state import tools_used as summarize_tools
-from backend.dependencies import ConversationServiceDep, DbSession
+from backend.dependencies import (
+    ConversationServiceDep,
+    CurrentUser,
+    DbSession,
+    RateLimiterDep,
+    SettingsDep,
+)
 from backend.schemas import (
     AgentMessageCreate,
     AgentMessageResponse,
@@ -27,11 +33,13 @@ async def create_conversation(
     payload: ConversationCreate,
     session: DbSession,
     conversations: ConversationServiceDep,
+    user: CurrentUser,
 ) -> ConversationRead:
+    # Ownership always comes from the token, never from the request body.
     conversation = await conversations.create(
         session,
         title=payload.title,
-        user_id=payload.user_id,
+        user_id=user.id,
     )
     return ConversationRead.model_validate(conversation)
 
@@ -40,11 +48,12 @@ async def create_conversation(
 async def list_conversations(
     session: DbSession,
     conversations: ConversationServiceDep,
+    user: CurrentUser,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> ConversationListResponse:
     items, total = await conversations.list_conversations(
-        session, limit=limit, offset=offset
+        session, user_id=user.id, limit=limit, offset=offset
     )
 
     return ConversationListResponse(
@@ -58,8 +67,9 @@ async def get_conversation(
     conversation_id: uuid.UUID,
     session: DbSession,
     conversations: ConversationServiceDep,
+    user: CurrentUser,
 ) -> ConversationDetailResponse:
-    conversation = await conversations.get(session, conversation_id)
+    conversation = await conversations.get(session, conversation_id, user.id)
     messages = await conversations.get_messages(session, conversation_id)
 
     return ConversationDetailResponse(
@@ -73,8 +83,9 @@ async def delete_conversation(
     conversation_id: uuid.UUID,
     session: DbSession,
     conversations: ConversationServiceDep,
+    user: CurrentUser,
 ) -> DeleteResponse:
-    await conversations.delete(session, conversation_id)
+    await conversations.delete(session, conversation_id, user.id)
     return DeleteResponse(id=conversation_id)
 
 
@@ -83,8 +94,9 @@ async def list_messages(
     conversation_id: uuid.UUID,
     session: DbSession,
     conversations: ConversationServiceDep,
+    user: CurrentUser,
 ) -> list[MessageRead]:
-    await conversations.get(session, conversation_id)
+    await conversations.get(session, conversation_id, user.id)
     messages = await conversations.get_messages(session, conversation_id)
 
     return [MessageRead.model_validate(message) for message in messages]
@@ -100,16 +112,24 @@ async def create_message(
     payload: MessageCreate,
     session: DbSession,
     conversations: ConversationServiceDep,
+    user: CurrentUser,
+    limiter: RateLimiterDep,
+    settings: SettingsDep,
 ) -> MessageResponse:
     """Append a user turn and return the assistant reply.
 
     With ``use_rag=true`` the question is answered from retrieved document
     chunks; ``document_ids`` restricts retrieval to those documents.
     """
+    await limiter.enforce(
+        "chat", f"user:{user.id}", settings.rate_limit_chat_per_minute
+    )
+
     message, sources = await conversations.post_message(
         session,
         conversation_id=conversation_id,
         content=payload.content,
+        user_id=user.id,
         use_rag=payload.use_rag,
         document_ids=payload.document_ids,
         top_k=payload.top_k,
@@ -133,6 +153,9 @@ async def create_agent_message(
     payload: AgentMessageCreate,
     session: DbSession,
     conversations: ConversationServiceDep,
+    user: CurrentUser,
+    limiter: RateLimiterDep,
+    settings: SettingsDep,
 ) -> AgentMessageResponse:
     """Answer a turn through the agent graph.
 
@@ -143,10 +166,15 @@ async def create_agent_message(
     ``POST /conversations/{id}/messages`` remains the plain chat/RAG path and is
     unaffected.
     """
+    await limiter.enforce(
+        "agent", f"user:{user.id}", settings.rate_limit_chat_per_minute
+    )
+
     message, state = await conversations.run_agent_turn(
         session,
         conversation_id=conversation_id,
         content=payload.content,
+        user_id=user.id,
         use_rag=payload.use_rag,
         document_ids=payload.document_ids,
     )

@@ -223,6 +223,7 @@ class AgentNodes:
 
         sources = await self.rag.retrieve(
             question=state.get("user_message", ""),
+            user_id=state.get("user_id", ""),
             document_ids=document_ids,
         )
 
@@ -342,6 +343,9 @@ class AgentNodes:
             rag_service=self.rag,
             document_service=runtime.get("document_service"),
             settings=self.settings,
+            # Straight from the state, which AgentService filled from the
+            # authenticated principal. The model never supplies this.
+            user_id=state.get("user_id") or None,
             document_ids=state.get("document_ids") or None,
             sources=[],
         )

@@ -9,7 +9,10 @@ startup, and every destructive mode requires an explicit --yes.
     # 2. Delete only vectors whose document_id has no row in PostgreSQL
     python -m backend.scripts.reset_qdrant --purge-orphans --yes
 
-    # 3. Drop and recreate the whole collection
+    # 3. Tag pre-authentication points with their owner's user_id
+    python -m backend.scripts.reset_qdrant --backfill-user-ids --yes
+
+    # 4. Drop and recreate the whole collection
     python -m backend.scripts.reset_qdrant --recreate --yes
 
 Only the collection named by QDRANT_COLLECTION is ever touched.
@@ -26,7 +29,44 @@ from sqlalchemy.exc import SQLAlchemyError
 from backend.config import get_settings
 from backend.db import create_engine
 from backend.models import Document
-from backend.services.vector_store import VectorStore
+from backend.services.vector_store import VectorStore, build_filter
+
+
+async def _document_owners(database_url: str) -> dict[str, str] | None:
+    """Map document_id -> user_id straight from PostgreSQL."""
+    engine = create_engine(database_url)
+
+    try:
+        async with engine.connect() as connection:
+            result = await connection.execute(
+                select(Document.id, Document.user_id)
+            )
+            return {str(row[0]): str(row[1]) for row in result.all()}
+    except (SQLAlchemyError, OSError) as exc:
+        print(f"WARNING: cannot read document owners: {type(exc).__name__}")
+        return None
+
+
+async def _backfill_user_ids(client, collection: str, owners: dict[str, str]) -> int:
+    """Give untagged points the user_id of the document they belong to.
+
+    Vectors indexed before multi-tenancy have no ``user_id`` payload, so every
+    tenant-scoped query filters them out — they are invisible rather than
+    leaked. This repairs them in place instead of forcing a re-upload.
+    """
+    updated = 0
+
+    for document_id, user_id in sorted(owners.items()):
+        # The selector argument is called `points`, and it accepts a Filter.
+        await client.set_payload(
+            collection_name=collection,
+            payload={"user_id": user_id},
+            points=build_filter(document_ids=[document_id]),
+            wait=True,
+        )
+        updated += 1
+
+    return updated
 
 
 async def _known_document_ids(database_url: str) -> set[str] | None:
@@ -135,8 +175,32 @@ async def run(args: argparse.Namespace) -> int:
             for document_id, count in sorted(orphans.items()):
                 print(f"  - {document_id}: {count} point(s)")
 
-        if not (args.purge_orphans or args.recreate):
-            print("\nNothing changed. Pass --purge-orphans or --recreate (with --yes).")
+        if not (args.purge_orphans or args.recreate or args.backfill_user_ids):
+            print(
+                "\nNothing changed. Pass --purge-orphans, --backfill-user-ids "
+                "or --recreate (with --yes)."
+            )
+            return 0
+
+        if args.backfill_user_ids:
+            owners = await _document_owners(settings.database_url)
+
+            if owners is None:
+                print(
+                    "\nRefusing to backfill: document owners cannot be read. "
+                    "Run `alembic upgrade head` first."
+                )
+                return 2
+
+            if not args.yes:
+                print(
+                    f"\nWould tag points of {len(owners)} document(s) with their "
+                    "owner's user_id. Re-run with --yes to actually do it."
+                )
+                return 1
+
+            updated = await _backfill_user_ids(client, collection, owners)
+            print(f"\nTagged points for {updated} document(s) with a user_id.")
             return 0
 
         if args.purge_orphans and known is None:
@@ -194,6 +258,11 @@ def main() -> int:
         help="delete vectors whose document_id has no matching Document row",
     )
     parser.add_argument(
+        "--backfill-user-ids",
+        action="store_true",
+        help="tag points that predate multi-tenancy with their document's owner",
+    )
+    parser.add_argument(
         "--recreate",
         action="store_true",
         help="drop the collection and recreate it empty with the configured vector size",
@@ -206,8 +275,18 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if args.purge_orphans and args.recreate:
-        parser.error("--purge-orphans and --recreate are mutually exclusive")
+    chosen = [
+        name
+        for name, value in (
+            ("--purge-orphans", args.purge_orphans),
+            ("--recreate", args.recreate),
+            ("--backfill-user-ids", args.backfill_user_ids),
+        )
+        if value
+    ]
+
+    if len(chosen) > 1:
+        parser.error(f"{' and '.join(chosen)} are mutually exclusive")
 
     return asyncio.run(run(args))
 

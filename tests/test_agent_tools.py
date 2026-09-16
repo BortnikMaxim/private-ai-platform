@@ -16,11 +16,12 @@ from backend.agent.tools.registry import ToolRegistry, default_registry
 
 
 @pytest.fixture
-def context(session_factory, rag_service, document_service, settings):
+def context(session_factory, rag_service, document_service, settings, user):
     return ToolContext(
         rag_service=rag_service,
         document_service=document_service,
         settings=settings,
+        user_id=str(user.id),
     )
 
 

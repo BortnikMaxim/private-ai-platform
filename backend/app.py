@@ -4,17 +4,20 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 import redis.asyncio as redis
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from qdrant_client import AsyncQdrantClient
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.agent.graph import AgentService
 from backend.agent.tools.registry import default_registry
-from backend.api import conversations, documents, health, rag
+from backend.api import admin, auth, conversations, documents, health, rag
 from backend.config import Settings
 from backend.config import settings as default_settings
 from backend.db import create_engine
-from backend.errors import AppError
+from backend.errors import AppError, RateLimitExceededError
+from backend.services.auth_service import AuthService
 from backend.services.broker import BrokerClient
 from backend.services.conversation_service import ConversationService
 from backend.services.document_processor import DocumentProcessor
@@ -22,6 +25,7 @@ from backend.services.document_service import DocumentService
 from backend.services.embeddings import EmbeddingService
 from backend.services.inference_client import InferenceClient
 from backend.services.rag_service import RagService
+from backend.services.rate_limiter import RateLimiter
 from backend.services.storage import DocumentStorage
 from backend.services.vector_store import VectorStore
 
@@ -154,6 +158,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.agent_service = agent_service
         app.state.broker = broker
         app.state.task_dispatcher = task_dispatcher
+        app.state.auth_service = AuthService(settings=settings)
+        app.state.rate_limiter = RateLimiter(
+            redis=redis_client,
+            window_seconds=settings.rate_limit_window_seconds,
+            enabled=settings.rate_limit_enabled,
+        )
 
         # A missing collection or an unreachable Qdrant must not stop the API
         # from serving /health, which is how an operator finds out what broke.
@@ -193,7 +203,20 @@ async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
             exc.detail,
         )
 
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    headers: dict[str, str] = {}
+
+    if exc.status_code == 401:
+        # RFC 6750: tell the client which scheme to retry with.
+        headers["WWW-Authenticate"] = "Bearer"
+
+    if isinstance(exc, RateLimitExceededError):
+        headers["Retry-After"] = str(exc.retry_after)
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=headers or None,
+    )
 
 
 async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -203,6 +226,23 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Conservative headers for an API-only service.
+
+    No CSP: this backend serves JSON plus the Swagger page, and a strict policy
+    would break the docs UI without protecting anything real.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+
+        return response
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or default_settings
 
@@ -210,14 +250,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title=settings.app_name,
         version=settings.app_version,
         lifespan=lifespan,
+        # Makes the Authorize button in Swagger issue `Authorization: Bearer`.
+        swagger_ui_init_oauth=None,
     )
 
     app.state.settings = settings
+
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    origins = settings.cors_origins
+
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
+    elif settings.is_production:
+        logger.info("CORS is disabled: no CORS_ALLOWED_ORIGINS configured")
 
     app.add_exception_handler(AppError, app_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)
 
     app.include_router(health.router)
+    app.include_router(auth.router)
+    app.include_router(admin.router)
     app.include_router(documents.router)
     app.include_router(conversations.router)
     app.include_router(rag.router)

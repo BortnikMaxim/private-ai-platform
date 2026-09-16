@@ -3,10 +3,13 @@ import uuid
 from fastapi import APIRouter, File, Query, UploadFile, status
 
 from backend.dependencies import (
+    CurrentUser,
     DbSession,
     DocumentProcessorDep,
     DocumentServiceDep,
+    RateLimiterDep,
     SessionFactoryDep,
+    SettingsDep,
     TaskDispatcherDep,
 )
 from backend.schemas import (
@@ -31,6 +34,9 @@ async def create_document(
     session: DbSession,
     documents: DocumentServiceDep,
     dispatcher: TaskDispatcherDep,
+    user: CurrentUser,
+    limiter: RateLimiterDep,
+    settings: SettingsDep,
     file: UploadFile = File(...),
 ) -> DocumentAcceptedResponse:
     """Accept a PDF and queue it for ingestion.
@@ -40,7 +46,11 @@ async def create_document(
     ``GET /documents/{document_id}`` until ``status`` is ``ready`` or
     ``failed``.
     """
-    document = await documents.create_pending(session, file)
+    await limiter.enforce(
+        "upload", f"user:{user.id}", settings.rate_limit_upload_per_minute
+    )
+
+    document = await documents.create_pending(session, file, user_id=user.id)
 
     task_id = dispatcher.enqueue_document_processing(document.id)
     await documents.attach_task(session, document.id, task_id)
@@ -63,6 +73,7 @@ async def upload_document(
     session_factory: SessionFactoryDep,
     documents: DocumentServiceDep,
     processor: DocumentProcessorDep,
+    user: CurrentUser,
     file: UploadFile = File(...),
 ) -> LegacyUploadResponse:
     """Compatibility wrapper that keeps the original blocking semantics.
@@ -73,7 +84,7 @@ async def upload_document(
     and blocks the request for the whole parse/embed cycle. New clients should
     use ``POST /documents``.
     """
-    document = await documents.create_pending(session, file)
+    document = await documents.create_pending(session, file, user_id=user.id)
 
     try:
         document = await processor.process(session_factory, document.id)
@@ -96,10 +107,13 @@ async def upload_document(
 async def list_documents(
     session: DbSession,
     documents: DocumentServiceDep,
+    user: CurrentUser,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> DocumentListResponse:
-    items, total = await documents.list_documents(session, limit=limit, offset=offset)
+    items, total = await documents.list_documents(
+        session, user_id=user.id, limit=limit, offset=offset
+    )
 
     return DocumentListResponse(
         items=[DocumentRead.model_validate(item) for item in items],
@@ -112,6 +126,7 @@ async def get_document(
     document_id: uuid.UUID,
     session: DbSession,
     documents: DocumentServiceDep,
+    user: CurrentUser,
     include_chunks: bool = Query(
         default=False,
         description="Include chunk metadata and text in the response",
@@ -126,6 +141,7 @@ async def get_document(
     document = await documents.get_document(
         session,
         document_id,
+        user_id=user.id,
         with_chunks=include_chunks,
     )
 
@@ -149,6 +165,7 @@ async def delete_document(
     session: DbSession,
     documents: DocumentServiceDep,
     dispatcher: TaskDispatcherDep,
+    user: CurrentUser,
 ) -> DeleteResponse:
     """Remove the document, its chunks, its Qdrant points and its source file.
 
@@ -156,5 +173,7 @@ async def delete_document(
     it is already past the point of no revoke, it detects the missing row and
     cleans up after itself instead of resurrecting the document.
     """
-    await documents.delete_document(session, document_id, dispatcher=dispatcher)
+    await documents.delete_document(
+        session, document_id, user_id=user.id, dispatcher=dispatcher
+    )
     return DeleteResponse(id=document_id)

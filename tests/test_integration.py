@@ -104,11 +104,17 @@ async def test_postgres_schema_matches_the_models():
         pytest.fail(f"Missing tables {sorted(missing)}; run `alembic upgrade head`")
 
 
+OWNER = str(uuid.uuid4())
+
+
 def _chunks(document_id: str, filename: str, vectors: list[list[float]]) -> list[dict]:
     return [
         {
             "point_id": str(uuid.uuid4()),
             "vector": vector,
+            # One tenant here; cross-tenant isolation is covered by
+            # tests/test_tenant_integration.py.
+            "user_id": OWNER,
             "document_id": document_id,
             "filename": filename,
             "page": 1,
@@ -156,11 +162,11 @@ async def test_qdrant_filtering_is_server_side_and_never_leaks_other_documents()
 
         query = [0.0, 1.0, 0.0, 0.0]  # nearest neighbours all belong to doc2
 
-        unfiltered = await store.search(query, limit=10)
+        unfiltered = await store.search(query, limit=10, user_id=OWNER)
         assert len(unfiltered) == 6
         assert unfiltered[0]["document_id"] == doc2, "doc2 should dominate unfiltered"
 
-        scoped = await store.search(query, limit=10, document_ids=[doc1])
+        scoped = await store.search(query, limit=10, user_id=OWNER, document_ids=[doc1])
 
         assert len(scoped) == 3
         assert {hit["document_id"] for hit in scoped} == {doc1}
@@ -170,22 +176,24 @@ async def test_qdrant_filtering_is_server_side_and_never_leaks_other_documents()
 
         # Server-side proof: only Qdrant-side filtering can return a doc1 hit
         # when the single nearest neighbour belongs to doc2.
-        narrow = await store.search(query, limit=1, document_ids=[doc1])
+        narrow = await store.search(query, limit=1, user_id=OWNER, document_ids=[doc1])
         assert len(narrow) == 1
         assert narrow[0]["document_id"] == doc1
 
         # Filtering on both documents restores the full result set.
-        both = await store.search(query, limit=10, document_ids=[doc1, doc2])
+        both = await store.search(query, limit=10, user_id=OWNER, document_ids=[doc1, doc2])
         assert len(both) == 6
 
         # Filtering on an unknown document yields nothing rather than everything.
-        unknown = await store.search(query, limit=10, document_ids=[str(uuid.uuid4())])
+        unknown = await store.search(
+            query, limit=10, user_id=OWNER, document_ids=[str(uuid.uuid4())]
+        )
         assert unknown == []
 
         # Deleting doc2 leaves doc1 untouched.
         await store.delete_document(doc2)
 
-        remaining = await store.search(query, limit=10)
+        remaining = await store.search(query, limit=10, user_id=OWNER)
         assert len(remaining) == 3
         assert {hit["document_id"] for hit in remaining} == {doc1}
 
